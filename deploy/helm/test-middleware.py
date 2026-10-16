@@ -41,8 +41,8 @@ def config(resources):
 def main():
     defaults = config(objects(render({})))
     assert "supervisor" not in defaults, "default registry changed"
-    entry = {"name": "credential-authority", "grpcEndpoint": "https://authority.platform.svc.cluster.local:9444",
-             "audience": "credential-access", "tlsCaConfigMapName": "authority-ca", "tlsCaKey": "root.pem",
+    entry = {"name": "protected-http", "grpcEndpoint": "https://authority.platform.svc.cluster.local:9444",
+             "audience": "protected-http", "tlsCaConfigMapName": "authority-ca", "tlsCaKey": "root.pem",
              "maxPayloadBytes": 4194304, "timeout": "30s"}
     for kind in ("statefulset", "deployment"):
         # Exercise both chart workload owners and preserve OIDC configuration beside middleware.
@@ -55,8 +55,8 @@ def main():
         assert actual["gateway"]["oidc"]["admin_role"] == "platform-admin"
         assert actual["drivers"]["kubernetes"]["host_gateway_ip"] == "172.30.42.1"
         assert actual["supervisor"]["middleware"] == [{
-            "name": "credential-authority", "grpc_endpoint": entry["grpcEndpoint"],
-            "audience": "credential-access", "tls_ca_cert_path": "/etc/openshell-middleware-ca/0/ca.crt",
+            "name": "protected-http", "grpc_endpoint": entry["grpcEndpoint"],
+            "audience": "protected-http", "tls_ca_cert_path": "/etc/openshell-middleware-ca/0/ca.crt",
             "max_payload_bytes": 4194304, "timeout": "30s", "allow_insecure_transport": False,
         }]
         workload = next(item for item in resources if item["kind"].lower() == kind)

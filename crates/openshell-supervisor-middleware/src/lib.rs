@@ -3,7 +3,7 @@
 
 //! Supervisor middleware registration and chain execution.
 
-pub mod credentials;
+pub mod external_exchange;
 pub mod headers;
 mod remote;
 mod response;
@@ -363,8 +363,7 @@ impl OnError {
 
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
-    pub credential_authority: bool,
-    pub execution_authority: bool,
+    pub external_http_exchange: bool,
     pub name: String,
     pub implementation: String,
     pub order: i32,
@@ -387,8 +386,7 @@ impl TryFrom<(&str, &NetworkMiddlewareConfig)> for ChainEntry {
         }
         Ok(Self {
             name: name.to_string(),
-            credential_authority: value.credential_authority,
-            execution_authority: value.execution_authority,
+            external_http_exchange: value.external_http_exchange,
             implementation: value.middleware.clone(),
             order: value.order,
             config: value.config.clone().unwrap_or_default(),
@@ -869,7 +867,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
-    HttpCredentials,
+    HttpExchange,
     HttpPreCredentials,
     HttpResponsePreReturn,
     WebSocketPreCredentials,
@@ -881,9 +879,9 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
     ) {
         (
-            Some(SupervisorMiddlewareOperation::HttpCredentials),
+            Some(SupervisorMiddlewareOperation::HttpExchange),
             Some(SupervisorMiddlewarePhase::PreCredentials),
-        ) => Ok(SupportedBinding::HttpCredentials),
+        ) => Ok(SupportedBinding::HttpExchange),
         (
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -1301,9 +1299,9 @@ impl MiddlewareRegistry {
         ensure_config_capacity(policy.network_middlewares.len())?;
         let runner = ChainRunner::from_registry(self.clone());
         for (name, config) in &policy.network_middlewares {
-            if config.credential_authority {
+            if config.external_http_exchange {
                 runner
-                    .credential_authority_policy(&[ChainEntry::try_from((name.as_str(), config))?])
+                    .http_exchange_policy(&[ChainEntry::try_from((name.as_str(), config))?])
                     .await?;
             }
             runner
@@ -1727,7 +1725,6 @@ impl ChainRunner {
         // borrow these values for every stage; only the gRPC adapter clones them
         // when an operator service requires an owned protobuf message.
         let context = RequestContext {
-            verified_credential_connector: None,
             request_id,
             sandbox_id,
             sandbox: sandbox_name,
@@ -2176,8 +2173,7 @@ mod tests {
 
     fn entry(name: &str, on_error: OnError) -> ChainEntry {
         ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: name.into(),
             implementation: BUILTIN_REGEX.into(),
             order: 0,
@@ -2317,8 +2313,7 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "first".into(),
                 implementation: "acme/redactor".into(),
                 order: 0,
@@ -2326,8 +2321,7 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "second".into(),
                 implementation: "acme/redactor".into(),
                 order: 10,
@@ -2457,8 +2451,7 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "replace".into(),
                 implementation: "test/replacement-transfer".into(),
                 order: 0,
@@ -2466,8 +2459,7 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "observe".into(),
                 implementation: "test/replacement-transfer".into(),
                 order: 10,
@@ -2539,8 +2531,7 @@ mod tests {
     async fn in_process_evaluation_remains_interruptible_by_stage_timeout() {
         let runner = ChainRunner::new(Arc::new(PendingInProcessService));
         let entry = |on_error| ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "pending".into(),
             implementation: "test/pending".into(),
             order: 0,
@@ -2671,8 +2662,7 @@ mod tests {
     #[tokio::test]
     async fn fail_open_allows_unavailable_middleware() {
         let unavailable = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -2690,8 +2680,7 @@ mod tests {
     #[tokio::test]
     async fn fail_closed_denies_unavailable_middleware() {
         let unavailable = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -2986,8 +2975,7 @@ mod tests {
         });
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "transform".into(),
             implementation: "test/two-stage".into(),
             order: 0,
@@ -3003,8 +2991,7 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "second".into(),
             implementation: "test/two-stage".into(),
             order: 10,
@@ -3052,8 +3039,7 @@ mod tests {
         });
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "transform".into(),
             implementation: "test/two-stage".into(),
             order: 0,
@@ -3069,8 +3055,7 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "second".into(),
             implementation: "test/two-stage".into(),
             order: 10,
@@ -3109,8 +3094,7 @@ mod tests {
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let entries = [
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "transform".into(),
                 implementation: "test/two-stage".into(),
                 order: 0,
@@ -3126,8 +3110,7 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "second".into(),
                 implementation: "test/two-stage".into(),
                 order: 10,
@@ -3409,8 +3392,7 @@ mod tests {
             let runner = ChainRunner::new_protobuf_for_tests(service.clone());
             let entries = [
                 ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "first".into(),
                     implementation: "test/header-chain".into(),
                     order: 0,
@@ -3418,8 +3400,7 @@ mod tests {
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "second".into(),
                     implementation: "test/header-chain".into(),
                     order: 10,
@@ -3427,8 +3408,7 @@ mod tests {
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "observer".into(),
                     implementation: "test/header-chain".into(),
                     order: 20,
@@ -3461,8 +3441,7 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "writer".into(),
                 implementation: "test/in-process-header-chain".into(),
                 order: 0,
@@ -3470,8 +3449,7 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "observer".into(),
                 implementation: "test/in-process-header-chain".into(),
                 order: 10,
@@ -3535,8 +3513,7 @@ mod tests {
             .collect(),
         };
         let recorder_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "recorder".into(),
             implementation: "test/recorder".into(),
             order: 0,
@@ -3678,8 +3655,7 @@ mod tests {
     #[tokio::test]
     async fn describe_chain_marks_resolved_and_unresolved_entries() {
         let unresolved = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 10,
@@ -3705,8 +3681,7 @@ mod tests {
             result: allow_result(),
         }));
         let entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "external".into(),
             implementation: "test/middleware".into(),
             order: 0,
@@ -3745,8 +3720,7 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let external_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "external".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -3787,8 +3761,7 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "guard".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -3832,8 +3805,7 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "guard".into(),
             implementation: "local-guard-service".into(),
             order: 10,
@@ -4157,8 +4129,7 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = |on_error| ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4201,8 +4172,7 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4241,8 +4211,7 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4307,9 +4276,7 @@ mod tests {
             network_middlewares: HashMap::from([(
                 "guard".into(),
                 NetworkMiddlewareConfig {
-                    credential_connectors: Vec::new(),
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: String::new(),
                     middleware: "local-guard-service".into(),
                     order: 0,
@@ -4334,8 +4301,7 @@ mod tests {
             .evaluate(
                 &[
                     ChainEntry {
-                        credential_authority: false,
-                        execution_authority: false,
+                        external_http_exchange: false,
                         name: "primary".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4343,8 +4309,7 @@ mod tests {
                         on_error: OnError::FailClosed,
                     },
                     ChainEntry {
-                        credential_authority: false,
-                        execution_authority: false,
+                        external_http_exchange: false,
                         name: "secondary".into(),
                         implementation: "secondary-guard-service".into(),
                         order: 10,
@@ -4444,8 +4409,7 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4503,8 +4467,7 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4581,8 +4544,7 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4625,8 +4587,7 @@ mod tests {
             let outcome = runner
                 .evaluate(
                     &[ChainEntry {
-                        credential_authority: false,
-                        execution_authority: false,
+                        external_http_exchange: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4685,8 +4646,7 @@ mod tests {
             let outcome = ChainRunner::from_registry(registry)
                 .evaluate(
                     &[ChainEntry {
-                        credential_authority: false,
-                        execution_authority: false,
+                        external_http_exchange: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4724,8 +4684,7 @@ mod tests {
             let outcome = runner
                 .evaluate(
                     &[ChainEntry {
-                        credential_authority: false,
-                        execution_authority: false,
+                        external_http_exchange: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4771,8 +4730,7 @@ mod tests {
         }));
         let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
             .map(|index| ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: format!("guard-{index}"),
                 implementation: "test/middleware".into(),
                 order: i32::try_from(index).expect("bounded stage index"),
@@ -5328,8 +5286,7 @@ mod tests {
         on_error: OnError,
     ) -> ChainEntry {
         ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: name.into(),
             implementation: implementation.into(),
             order,
@@ -5367,8 +5324,7 @@ mod tests {
                 result: allow_result(),
             }));
             let chain = [ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "http-guard".into(),
                 implementation: "test/http-only".into(),
                 order: 0,
@@ -5410,8 +5366,7 @@ mod tests {
             result: allow_result(),
         }));
         let chain = [ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "http-guard".into(),
             implementation: "test/http-only".into(),
             order: 0,
@@ -5773,8 +5728,7 @@ mod tests {
         let service = OpenAiRedactionService::default();
         let runner = ChainRunner::from_endpoint(Arc::new(service));
         let chain = [ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "openai-redactor".into(),
             implementation: "test/openai-websocket-redactor".into(),
             order: 0,
@@ -5839,8 +5793,7 @@ mod tests {
             .expect("connect WebSocket middleware");
         let runner = ChainRunner::from_registry(registry);
         let chain = [ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "openai-redactor".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -5936,8 +5889,7 @@ mod tests {
             .expect("connect WebSocket middleware");
         let runner = ChainRunner::from_registry(registry);
         let chain = [ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "openai-redactor".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -6036,8 +5988,7 @@ mod tests {
                 .expect("connect mixed middleware services"),
         );
         let broken_entry = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "best-effort-remote".into(),
             implementation: "test/openai-websocket-redactor".into(),
             order: 0,
@@ -6240,8 +6191,7 @@ mod tests {
         let result = runner
             .preflight_websocket(
                 &[ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "scope".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,

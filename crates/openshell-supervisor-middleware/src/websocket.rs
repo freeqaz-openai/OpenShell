@@ -955,7 +955,6 @@ async fn open_stage(entry: DescribedChainEntry, input: WebSocketPreflightInput) 
         session_id: input.session_id,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         context: Some(RequestContext {
-            verified_credential_connector: None,
             request_id: input.request_id,
             sandbox_id: input.sandbox_id,
             sandbox: input.sandbox_name,
@@ -1446,8 +1445,7 @@ mod tests {
         let mut stage = WebSocketStage {
             entry: DescribedChainEntry {
                 entry: ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "best-effort".into(),
                     implementation: "test/middleware".into(),
                     order: 0,

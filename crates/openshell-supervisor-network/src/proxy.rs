@@ -587,7 +587,242 @@ impl ProxyHandle {
 }
 
 pub(crate) mod transparent_admission;
-use transparent_admission::preauthorize_transparent_open;
+#[allow(clippy::too_many_arguments)]
+async fn preauthorize_transparent_open(
+    connection: PendingTcpOpen,
+    policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
+    opa_engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    backend_host_gateway: Option<IpAddr>,
+    trusted_host_gateway: Option<IpAddr>,
+    has_policy_local: bool,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+) -> Option<AcceptedProxyConnection> {
+    let PendingTcpOpen {
+        stream,
+        binary_identity,
+        destination,
+        socket: _,
+        policy_generation,
+        timing,
+        decision: completion,
+    } = connection;
+    let _timing = NetworkOpenTimingGuard {
+        timing,
+        operation: "tcp",
+    };
+    if destination.ip() == IpAddr::V4(crate::policy_dns::POLICY_LOCAL_ADDRESS) {
+        if destination.port() != 80 || !has_policy_local {
+            emit_staged_transparent_denial(
+                destination,
+                None,
+                &binary_identity,
+                "sandbox-local policy API requires port 80 and an active context",
+                "transparent_tcp_policy_local_invalid_destination",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        }
+        let identity_check = binary_identity
+            .as_ref()
+            .map_err(|_| TcpOpenDenial::IdentityUnavailable)
+            .and_then(|identity| {
+                identity_cache
+                    .verify_or_cache_supplied_identity(identity)
+                    .map_err(|error| match error {
+                        SuppliedIdentityError::Unavailable(_) => TcpOpenDenial::IdentityUnavailable,
+                        SuppliedIdentityError::CapacityExhausted => {
+                            TcpOpenDenial::ResourceExhausted
+                        }
+                    })
+            });
+        if let Err(denial) = identity_check {
+            emit_staged_transparent_denial(
+                destination,
+                None,
+                &binary_identity,
+                "sandbox-local policy API requires a verified workload identity",
+                "transparent_tcp_policy_local_identity_unavailable",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(denial));
+            return None;
+        }
+        if completion.send(TcpOpenDecision::RelayReady).is_err() {
+            return None;
+        }
+        return Some((
+            stream,
+            Some(binary_identity),
+            None,
+            Some(TransparentOpen {
+                destination,
+                authorization: None,
+            }),
+        ));
+    }
+    let TransparentTarget { host, intent } =
+        match resolve_transparent_target(destination, policy_dns_store, opa_engine) {
+            Ok(target) => target,
+            Err(error) => {
+                warn!(%destination, %error, "Denied staged transparent connection");
+                emit_staged_transparent_denial(
+                    destination,
+                    None,
+                    &binary_identity,
+                    &error.to_string(),
+                    "transparent_tcp_mapping_denied",
+                );
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+                return None;
+            }
+        };
+    let mapped_host = intent.is_some().then_some(host.as_str());
+    let supplied_authorization = authorize_supplied_identity_inner(
+        opa_engine,
+        identity_cache,
+        EgressIntent::connect(host.clone(), destination.port()),
+        &binary_identity,
+        Some(&transparent_admission::VerifiedTransparentConnect::new(
+            policy_generation,
+        )),
+    );
+    let mut decision = supplied_authorization.decision;
+    if let NetworkAction::Deny { reason } = &decision.action {
+        let (denial, status_detail) = supplied_authorization.denial.map_or(
+            (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
+            |denial| match denial {
+                SuppliedIdentityDenial::IdentityUnavailable => (
+                    TcpOpenDenial::IdentityUnavailable,
+                    "transparent_tcp_identity_unavailable",
+                ),
+                SuppliedIdentityDenial::ResourceExhausted => (
+                    TcpOpenDenial::ResourceExhausted,
+                    "transparent_tcp_resource_exhausted",
+                ),
+            },
+        );
+        warn!(%destination, %reason, "Denied staged transparent connection");
+        emit_staged_transparent_denial(
+            destination,
+            mapped_host,
+            &binary_identity,
+            reason,
+            status_detail,
+        );
+        if supplied_authorization.denial.is_none()
+            && !is_always_blocked_ip(destination.ip())
+            && let Some(binary) = decision.binary.as_ref()
+        {
+            emit_denial_simple(
+                denial_tx,
+                &host,
+                destination.port(),
+                &binary.to_string_lossy(),
+                &decision,
+                reason,
+                "transparent_tcp_connect",
+            );
+        }
+        let _ = completion.send(TcpOpenDecision::Denied(denial));
+        return None;
+    }
+    // A synthetic destination may dial only the addresses pinned for the
+    // generation that produced this decision. Re-acquiring the mapping at that
+    // generation keeps a policy reload between correlation and authorization
+    // from falling back to resolving the name again. Observation records pin
+    // no addresses, so they never reach an upstream dial.
+    let pinned_plan = match &intent {
+        None => None,
+        Some(intent) => match policy_dns_store
+            .ok_or(MappingLookupError::Missing)
+            .and_then(|store| pinned_transparent_plan(store, destination, &decision))
+        {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                let (reason, status_detail) = match error {
+                    _ if intent.record.is_observation() => (
+                        "unapproved DNS observation cannot authorize egress".to_string(),
+                        "transparent_tcp_observation_denied",
+                    ),
+                    MappingLookupError::InvalidMapping => (
+                        "policy DNS produced an invalid pinned destination".to_string(),
+                        "transparent_tcp_destination_denied",
+                    ),
+                    error => (
+                        format!("transparent destination mapping is unavailable: {error}"),
+                        "transparent_tcp_mapping_denied",
+                    ),
+                };
+                warn!(%destination, %reason, "Denied staged transparent connection");
+                emit_staged_transparent_denial(
+                    destination,
+                    mapped_host,
+                    &binary_identity,
+                    &reason,
+                    status_detail,
+                );
+                let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+                return None;
+            }
+        },
+    };
+    if let Err(denial) =
+        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
+    {
+        warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+        emit_staged_transparent_denial(
+            destination,
+            mapped_host,
+            &binary_identity,
+            &denial.reason,
+            "transparent_tcp_destination_denied",
+        );
+        let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+        return None;
+    }
+    if let Some(plan) = pinned_plan {
+        decision.endpoint.destination = Some(plan);
+    }
+    let plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
+    let connector = match validate_destination(DestinationRequest {
+        host: &host,
+        port: destination.port(),
+        sandbox_entrypoint_pid: 0,
+        plan,
+    })
+    .await
+    {
+        Ok(connector) => connector,
+        Err(denial) => {
+            warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
+            emit_staged_transparent_denial(
+                destination,
+                mapped_host,
+                &binary_identity,
+                &denial.reason,
+                "transparent_tcp_destination_denied",
+            );
+            let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
+            return None;
+        }
+    };
+    if completion.send(TcpOpenDecision::RelayReady).is_err() {
+        return None;
+    }
+    Some((
+        stream,
+        Some(binary_identity),
+        None,
+        Some(TransparentOpen {
+            destination,
+            authorization: Some((decision, connector)),
+        }),
+    ))
+}
 
 fn emit_staged_transparent_denial(
     destination: SocketAddr,
@@ -2057,32 +2292,6 @@ where
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod credential_tests;
-#[cfg(test)]
-#[test]
-fn host_launcher_identity_cannot_produce_credential_connection_proof() {
-    let policy = openshell_policy::parse_sandbox_policy(&format!(
-        "version: 1\nnetwork_middlewares:\n  protected:\n    middleware: test/authority\n    credential_authority: true\n    credential_connectors:\n      - path: /bin/launcher\n        sha256: {}\n    endpoints:\n      include: [protected.test]\nnetwork_policies:\n  ordinary:\n    endpoints:\n      - host: protected.test\n        port: 443\n    binaries:\n      - path: /bin/launcher\n", "a".repeat(64)
-    )).unwrap();
-    let engine = OpaEngine::from_proto(&policy).unwrap();
-    let identity = Ok(ContractBinaryIdentity {
-        executable: ContractExecutableIdentity {
-            path: "/bin/launcher".into(),
-            digest: Some("a".repeat(64).parse().unwrap()),
-        },
-        ancestors: vec![],
-        cmdline_paths: vec![],
-    });
-    let result = authorize_supplied_identity_inner(
-        &engine,
-        &BinaryIdentityCache::new(),
-        EgressIntent::connect("protected.test".into(), 443),
-        &identity,
-        None,
-    );
-    assert!(matches!(result.decision.action, NetworkAction::Deny { .. }));
-    assert!(result.decision.endpoint.credential_connection.is_none());
-}
-
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
@@ -2486,6 +2695,14 @@ async fn handle_mediated_connection(
     // connect and before `200 Connection Established`.
     hydrate_tls_mode(&mut decision);
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
+    if decision.endpoint.exchange_connection.is_some()
+        && (upstream_proxy.is_some() || effective_tls_skip || tls_state.is_none())
+    {
+        return Err(miette::miette!(
+            "external_http_exchange requires direct, terminated HTTPS"
+        ));
+    }
+
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
     // Route materialization is safe before destination dialing and lets an
     // unambiguous MCP authority report local fail-closed outcomes that occur
@@ -2802,6 +3019,10 @@ async fn handle_mediated_connection(
     let Some(tunnel_protocol) = peek_tunnel_protocol(&mut client).await? else {
         return Ok(());
     };
+
+    if decision.endpoint.exchange_connection.is_some() && tunnel_protocol != TunnelProtocol::Tls {
+        return Err(miette::miette!("external_http_exchange requires HTTPS"));
+    }
 
     if tunnel_protocol == TunnelProtocol::Tls {
         // TLS detected — terminate unconditionally.
@@ -9923,8 +10144,7 @@ network_policies:
                 .expect("built-in middleware service"),
         );
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -10028,8 +10248,7 @@ network_policies:
         )
         .unwrap();
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "blocker".into(),
             implementation: "test/blocking-forward".into(),
             order: 0,
@@ -10186,8 +10405,7 @@ network_policies:
             },
         ));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/forward-response".into(),
             order: 0,
@@ -10275,8 +10493,7 @@ network_policies:
             },
         ));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/forward-response".into(),
             order: 0,
@@ -12869,8 +13086,7 @@ network_policies:
         );
         let guard = forward_test_guard();
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "redactor".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,

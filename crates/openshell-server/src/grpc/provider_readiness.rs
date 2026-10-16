@@ -714,4 +714,4 @@ fn ensure_peer_request<T>(request: &Request<T>) -> Result<(), Status> {
 
 #[cfg(test)]
 #[path = "provider_readiness_tests.rs"]
-mod tests;
+pub(crate) mod tests;

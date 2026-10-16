@@ -52,12 +52,12 @@ use openshell_core::proto::{
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    LoadedPolicyObservationV1, PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus,
-    ProviderReadinessReason, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderReadinessReason,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -2590,23 +2590,14 @@ async fn handle_get_sandbox_config_inner(
     .await?;
     let config = load_sandbox_config(state, &sandbox).await?;
     if matches!(principal, Principal::Sandbox(_))
-        && config.policy.as_ref().is_some_and(|policy| {
-            policy
-                .network_middlewares
-                .values()
-                .filter(|e| e.credential_authority)
-                .any(|entry| {
-                    openshell_core::extension_protocol::credential_enforcement_profile(
-                        entry.execution_authority,
-                    )
+        && requires_external_http_exchange(&config)
+        && openshell_core::extension_protocol::external_http_exchange_capabilities()
+            .iter()
+            .any(|cap| {
+                !req.supported_enforcement_capabilities
                     .iter()
-                    .any(|cap| {
-                        !req.supported_enforcement_capabilities
-                            .iter()
-                            .any(|v| v == cap)
-                    })
-                })
-        })
+                    .any(|v| v == cap)
+            })
     {
         // Preserve the observation tuple so an older supervisor can report its
         // rejection under the existing registration fence and wait for repair.
@@ -4305,7 +4296,6 @@ pub(super) async fn handle_get_sandbox_policy_status(
 
     let revision = policy_record_to_revision(&record, true)?;
     let mut loaded_enforcement = None;
-    let mut loaded_policy_observation = None;
     if let Some(sandbox) = &sandbox
         && enforcement_runtime_active(sandbox)
         && revision.status == i32::from(PolicyStatus::Loaded)
@@ -4326,21 +4316,22 @@ pub(super) async fn handle_get_sandbox_policy_status(
             && configuration_generation_matches(admission, &config)
             && validate_loaded_enforcement(sandbox.object_id(), admission, &config).is_ok()
         {
-            // Preserve field 3's original predicates, including identical-hash
-            // global overrides. V1 independently requires a sandbox source.
-            if (admission.policy_version, &admission.policy_hash)
-                == (revision.version, &revision.policy_hash)
-            {
-                loaded_enforcement.clone_from(&admission.loaded_enforcement);
-            }
-            loaded_policy_observation =
-                loaded_policy_observation_v1(sandbox, &revision, admission, &config);
-            if let Some(observation) = &mut loaded_policy_observation {
-                if let Some(session) = state.supervisor_sessions.provider_readiness(&policy_id)? {
-                    observation.registered_exchange_public_key = session
-                        .exchange_key(&admission.instance_id)
-                        .unwrap_or_default()
-                        .to_vec();
+            if exact_loaded_policy(&revision, &config) {
+                let mut evidence = admission.loaded_enforcement.clone().expect("checked above");
+                // Never echo reporter-owned data as a registration key.
+                evidence.registered_exchange_public_key = state
+                    .supervisor_sessions
+                    .provider_readiness(&policy_id)?
+                    .and_then(|session| {
+                        session
+                            .exchange_key(&admission.instance_id)
+                            .map(<[u8]>::to_vec)
+                    })
+                    .unwrap_or_default();
+                if !requires_external_http_exchange(&config)
+                    || !evidence.registered_exchange_public_key.is_empty()
+                {
+                    loaded_enforcement = Some(evidence);
                 }
             }
         }
@@ -4349,66 +4340,29 @@ pub(super) async fn handle_get_sandbox_policy_status(
         revision: Some(revision),
         active_version,
         loaded_enforcement,
-        loaded_policy_observation,
     }))
 }
 
-/// Called under the authenticated policy-status lock after checking the active
-/// loaded source revision and the registered supervisor's accepted admission.
-fn loaded_policy_observation_v1(
-    sandbox: &Sandbox,
+// Deliberately fail closed for composition: even legitimate provider-derived
+// additions require a future general derivation contract. No special equivalence.
+fn exact_loaded_policy(
     revision: &SandboxPolicyRevision,
-    admission: &openshell_core::proto::SandboxConfigurationAdmission,
     config: &GetSandboxConfigResponse,
-) -> Option<LoadedPolicyObservationV1> {
-    if config.policy_source != i32::from(PolicySource::Sandbox)
-        || !config.configuration_admitted
-        || admission.policy_version != revision.version
-        || !configuration_generation_matches(admission, config)
-        || validate_loaded_enforcement(sandbox.object_id(), admission, config).is_err()
-    {
-        return None;
-    }
-    let source = revision.policy.as_ref()?;
-    let effective = config.policy.as_ref()?;
-    let enforcement = admission.loaded_enforcement.as_ref()?;
-    let source_policy_hash = deterministic_policy_hash(source);
-    if source_policy_hash != revision.policy_hash
-        || enforcement.policy_hash != deterministic_policy_hash(effective)
-    {
-        return None;
-    }
+) -> bool {
+    revision.version == config.version
+        && revision.policy_hash == config.policy_hash
+        && revision.policy.as_ref().is_some_and(|source| {
+            config.policy.as_ref() == Some(source)
+                && deterministic_policy_hash(source) == revision.policy_hash
+        })
+}
 
-    let inert_provider_rule = if source == effective {
-        String::new()
-    } else {
-        let [provider] = sandbox.spec.as_ref()?.providers.as_slice() else {
-            return None;
-        };
-        let rule_name = openshell_policy::provider_rule_name(provider);
-        if source.network_policies.contains_key(&rule_name) {
-            return None;
-        }
-        let mut stripped = effective.clone();
-        let rule = stripped.network_policies.remove(&rule_name)?;
-        if rule
-            != (NetworkPolicyRule {
-                name: rule_name.clone(),
-                ..Default::default()
-            })
-            || &stripped != source
-        {
-            return None;
-        }
-        rule_name
-    };
-    Some(LoadedPolicyObservationV1 {
-        source_policy_hash,
-        effective_policy: Some(effective.clone()),
-        enforcement: Some(enforcement.clone()),
-        inert_provider_rule,
-        // The policy helper alone has no authority to identify the current session key.
-        registered_exchange_public_key: Vec::new(),
+fn requires_external_http_exchange(config: &GetSandboxConfigResponse) -> bool {
+    config.policy.as_ref().is_some_and(|policy| {
+        policy
+            .network_middlewares
+            .values()
+            .any(|entry| entry.external_http_exchange)
     })
 }
 
@@ -4531,14 +4485,9 @@ fn validate_loaded_enforcement(
     admission: &openshell_core::proto::SandboxConfigurationAdmission,
     config: &GetSandboxConfigResponse,
 ) -> Result<(), Status> {
-    let protects_credentials = config.policy.as_ref().is_some_and(|policy| {
-        policy
-            .network_middlewares
-            .values()
-            .any(|entry| entry.credential_authority)
-    });
+    let requires_exchange = requires_external_http_exchange(config);
     let Some(evidence) = &admission.loaded_enforcement else {
-        return if protects_credentials {
+        return if requires_exchange {
             Err(Status::failed_precondition(
                 "effective policy requires supervisor enforcement evidence",
             ))
@@ -4558,20 +4507,10 @@ fn validate_loaded_enforcement(
             "loaded enforcement generation does not match current configuration",
         ));
     }
-    let entries = config
-        .policy
-        .as_ref()
-        .into_iter()
-        .flat_map(|p| p.network_middlewares.values())
-        .filter(|e| e.credential_authority);
-    if (protects_credentials
-        && entries.into_iter().any(|entry| {
-            evidence.enforced_capabilities
-                != openshell_core::extension_protocol::credential_enforcement_profile(
-                    entry.execution_authority,
-                )
-        }))
-        || (!protects_credentials && !evidence.enforced_capabilities.is_empty())
+    if (requires_exchange
+        && evidence.enforced_capabilities
+            != openshell_core::extension_protocol::external_http_exchange_capabilities())
+        || (!requires_exchange && !evidence.enforced_capabilities.is_empty())
     {
         return Err(Status::failed_precondition(
             "loaded enforcement capabilities do not match effective policy",
@@ -4611,6 +4550,15 @@ pub(super) async fn handle_report_sandbox_configuration(
         .map_err(|_| Status::invalid_argument("invalid admission state"))?;
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
+    }
+    if admission
+        .loaded_enforcement
+        .as_ref()
+        .is_some_and(|evidence| !evidence.registered_exchange_public_key.is_empty())
+    {
+        return Err(Status::invalid_argument(
+            "registered exchange public key is gateway supplied",
+        ));
     }
     if admission.loaded_enforcement.is_some() {
         crate::auth::guard::ensure_sandbox_principal_scope(&principal, &sandbox_id)?;

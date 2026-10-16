@@ -7,6 +7,9 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use std::sync::Arc;
 
+/// JWT key profile for terminal HTTP exchange.
+pub const HTTP_EXCHANGE_KEY_PROFILE: &str = "openshell-http-exchange-v1";
+
 /// Clones share possession within the trusted supervisor; no private-key accessor or serializer.
 #[derive(Clone)]
 pub struct InstallationSigningKey(Arc<Ed25519KeyPair>);
@@ -24,10 +27,11 @@ impl InstallationSigningKey {
 
     /// Sign exactly the bytes transmitted, bound to the challenge from this response stream.
     #[must_use]
-    pub fn sign_opening(&self, challenge: &[u8; 32], resolve_request: &[u8]) -> Vec<u8> {
-        let mut transcript = Vec::from(b"openshell-exchange-v1\0".as_slice());
+    pub fn sign_opening(&self, challenge: &[u8; 32], opening: &[u8]) -> Vec<u8> {
+        let mut transcript = Vec::from(HTTP_EXCHANGE_KEY_PROFILE.as_bytes());
+        transcript.push(0);
         transcript.extend_from_slice(challenge);
-        transcript.extend_from_slice(resolve_request);
+        transcript.extend_from_slice(opening);
         self.0.sign(&transcript).as_ref().to_vec()
     }
 }

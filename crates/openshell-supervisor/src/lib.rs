@@ -1980,12 +1980,9 @@ trait StartupGateway: Send + Sync {
 }
 
 fn enforced_runtime_capabilities() -> Vec<String> {
-    openshell_core::extension_protocol::HTTP_CREDENTIAL_REQUIRED_CAPABILITIES
-        .into_iter()
-        .chain([
-            openshell_core::extension_protocol::HTTP_EXECUTION_AUTHORITY_CAPABILITY,
-            openshell_core::extension_protocol::HTTP_PROTECTED_NO_MATERIAL_CAPABILITY,
-        ])
+    openshell_core::extension_protocol::external_http_exchange_capabilities()
+        .iter()
+        .copied()
         .map(str::to_string)
         .collect()
 }

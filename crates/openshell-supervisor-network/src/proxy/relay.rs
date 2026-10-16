@@ -69,7 +69,7 @@ pub(super) fn http_context(
     };
 
     L7EvalContext {
-        credential_connection: decision.endpoint.credential_connection.clone(),
+        exchange_connection: decision.endpoint.exchange_connection.clone(),
         host: decision.intent.destination.host.clone(),
         port: decision.intent.destination.port,
         request_default_port: None,
@@ -155,6 +155,12 @@ pub(super) fn prepare_http_relay<'a>(
             decision.intent.destination.port,
             error,
         );
+        return None;
+    }
+
+    // A protected L4 admission must never become an uninspected direct relay.
+    if request.exchange_connection.is_some() && route.is_none_or(|route| route.configs.is_empty())
+    {
         return None;
     }
 
@@ -356,7 +362,7 @@ mod tests {
 
     fn request_context() -> L7EvalContext {
         L7EvalContext {
-            credential_connection: None,
+            exchange_connection: None,
             host: "example.com".to_string(),
             port: 80,
             request_default_port: Some(80),
@@ -375,6 +381,113 @@ mod tests {
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
             endpoint_observation_tx: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn external_exchange_l4_selection_cannot_fall_back_when_l7_selection_is_lost() {
+        use super::super::credential_tests::{admit, policy, resolve};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for multiple_routes in [false, true] {
+            let engine = OpaEngine::from_proto(&policy()).unwrap();
+            let (client, mut workload) = tokio::io::duplex(8192);
+            let (admitted, _) = admit(
+                Box::new(client),
+                &engine,
+                "203.0.113.10",
+                Ok(resolve(std::process::id())),
+            )
+            .await;
+            let (mut client, _, _, transparent) = admitted.unwrap();
+            let (mut decision, _) = transparent.unwrap().authorization.unwrap();
+            super::super::hydrate_l7_route(&mut decision);
+            let mut request = request_context();
+            request.host = "203.0.113.10".into();
+            request.port = 443;
+            request.request_default_port = Some(443);
+            request.upstream_transport = crate::l7::tls::UpstreamTransport::AuthenticatedTls;
+            request.exchange_connection = decision.endpoint.exchange_connection.clone();
+            assert!(request.exchange_connection.is_some());
+            // Even absent/empty L7 routing must not select passthrough.
+            assert!(prepare_http_relay(None, &engine, &decision, &request).is_none());
+            let empty = L7RouteSnapshot {
+                configs: vec![],
+                l7_policy_generation: decision.policy_generation,
+            };
+            assert!(prepare_http_relay(Some(&empty), &engine, &decision, &request).is_none());
+
+            let mut context = prepare_http_relay(
+                decision.endpoint.l7_route.as_ref(),
+                &engine,
+                &decision,
+                &request,
+            )
+            .unwrap();
+            let PreparedHttpPolicy::Inspect { configs, evaluator } = &mut context.policy else {
+                panic!("protected admission must select inspection");
+            };
+            if multiple_routes {
+                let mut other = configs[0].clone();
+                other.path = "/other".into();
+                configs.push(other);
+            }
+            // Inject only a missing L7 middleware selection into the captured
+            // evaluator. Keep the real L4 proof and its generation current, so
+            // neither a stale guard nor a denied route can mask direct fallback.
+            {
+                let mut rego = evaluator.engine().lock().unwrap();
+                let mut data = serde_json::to_value(rego.get_data()).unwrap();
+                data["network_middlewares"] = serde_json::json!({});
+                rego.clear_data();
+                rego.add_data_json(&data.to_string()).unwrap();
+            }
+            request
+                .exchange_connection
+                .as_ref()
+                .unwrap()
+                .proof_for(&request.host, request.port, evaluator.generation_guard())
+                .unwrap();
+            assert!(
+                evaluator
+                    .query_middleware_chain(&crate::l7::middleware::middleware_network_input(
+                        &request
+                    ))
+                    .unwrap()
+                    .is_empty()
+            );
+            let (mut direct, mut origin) = tokio::io::duplex(8192);
+            workload
+                .write_all(b"GET /admitted HTTP/1.1\r\nHost: 203.0.113.10:443\r\n\r\n")
+                .await
+                .unwrap();
+            let operation = async {
+                relay_http_stream(&mut client, &mut direct, context)
+                    .await
+                    .unwrap();
+                drop(client);
+                drop(direct);
+            };
+            let observe = async {
+                let mut sent = Vec::new();
+                origin.read_to_end(&mut sent).await.unwrap();
+                assert!(
+                    sent.is_empty(),
+                    "missing L7 selection must not send directly"
+                );
+                let mut returned = Vec::new();
+                workload.read_to_end(&mut returned).await.unwrap();
+                assert!(
+                    returned.starts_with(b"HTTP/1.1 502"),
+                    "allowed route must reach the closed exchange path"
+                );
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(operation, observe);
+            })
+            .await
+            .unwrap();
         }
     }
 

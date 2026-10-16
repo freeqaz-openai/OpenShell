@@ -141,10 +141,10 @@ binary_allowed(_, _) if {
 	not binary_identity_required
 }
 
-# A fresh execution-wide protected grant uses no executable selector. The supervisor sets
-# verified_execution_connect only for an actual blocked workload connect selected by typed
-# execution-authority policy, and carries that exact host/port/generation into REST evaluation.
-# Never relax binary checking for an ordinary endpoint, legacy pin grant or unverified input.
+# An explicit external_http_exchange grant admits verified workload connects to
+# enforced REST destinations without executable selectors. The supervisor binds
+# this private input to the blocked connect and current typed policy generation.
+# Ordinary endpoints and unverified inputs retain their normal binary checks.
 binary_allowed(policy, _) if {
 	object.get(input.network, "verified_execution_connect", false)
 	count(policy.binaries) == 0
@@ -200,9 +200,9 @@ network_action := "allow" if {
 
 # --- Authoritative egress authorization snapshot ---
 #
-# Rust evaluates this rule once per admitted connection. Credential-protected
-# hosts additionally require the independent verified-leaf connector gate under
-# the same engine lock; this route result alone never grants credential access. Keeping the action,
+# Rust evaluates this rule once per admitted connection. External exchange
+# destinations also require private blocked-connect evidence under the same
+# engine lock; this route result alone never authorizes delegation. Keeping the action,
 # matched policy, endpoint metadata, and exact-host signal in one result makes
 # them an atomic view of one policy generation.
 
@@ -1031,6 +1031,14 @@ endpoint_credential_guards := [cfg |
 	_matching_policy_names[pname]
 	cfgs := _policy_credential_guards(data.network_policies[pname])
 	cfg := cfgs[_]
+]
+
+# Check all overlapping routes for external exchange, independent of binary
+# admission. Keep this separate so stock endpoint ordering is unchanged.
+external_http_exchange_guards := [ep |
+	some policy in data.network_policies
+	some ep in policy.endpoints
+	endpoint_matches_request(ep, input.network)
 ]
 
 # Expose middleware policy data to Rust. Selection and validation stay in Rust;

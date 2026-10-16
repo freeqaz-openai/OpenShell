@@ -661,16 +661,16 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 		Version: 5,
 		NetworkMiddlewares: map[string]v1.NetworkMiddlewareConfig{
 			"rate-limiter": {
-				Name:                "rate-limiter",
-				Middleware:          "envoy-ratelimit",
-				OnError:             "fail_closed",
-				CredentialAuthority: true,
-				Order:               20,
+				Name:                 "rate-limiter",
+				Middleware:           "envoy-ratelimit",
+				OnError:              "fail_closed",
+				ExternalHttpExchange: true,
+				Order:                20,
 				Config: map[string]any{
 					"requests_per_second": float64(100),
 				},
 				Endpoints: &v1.MiddlewareEndpointSelector{
-					Include: []string{"api.*"},
+					Include: []string{"api.example.com"},
 				},
 			},
 		},
@@ -688,7 +688,7 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Middleware, mw.Middleware)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].OnError, mw.OnError)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Order, mw.Order)
-	assert.True(t, mw.CredentialAuthority)
+	assert.True(t, mw.ExternalHttpExchange)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Config["requests_per_second"], mw.Config["requests_per_second"])
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Endpoints.Include, mw.Endpoints.Include)
 }
@@ -714,7 +714,7 @@ func TestLoadedEnforcementEvidencePreservesIdentityAndOwnsCapabilities(t *testin
 	wire := &pb.GetSandboxPolicyStatusResponse{LoadedEnforcement: &pb.LoadedEnforcementEvidence{
 		SandboxId: "immutable-sandbox", InstanceId: "registration", PolicyVersion: 7,
 		PolicyHash: "digest", ConfigRevision: 41, ProviderEnvRevision: 43,
-		EnforcedCapabilities: []string{"openshell.supervisor-middleware.http-credential-access.v1"},
+		EnforcedCapabilities: []string{"openshell.supervisor-middleware.external-http-exchange.v1"},
 	}}
 	got := PolicyStatusResultFromProto(wire).LoadedEnforcement
 	assert.Equal(t, "immutable-sandbox", got.SandboxID)
@@ -724,6 +724,6 @@ func TestLoadedEnforcementEvidencePreservesIdentityAndOwnsCapabilities(t *testin
 	assert.Equal(t, uint64(41), got.ConfigRevision)
 	assert.Equal(t, uint64(43), got.ProviderEnvRevision)
 	wire.LoadedEnforcement.EnforcedCapabilities[0] = "mutated"
-	assert.Equal(t, []string{"openshell.supervisor-middleware.http-credential-access.v1"}, got.EnforcedCapabilities)
+	assert.Equal(t, []string{"openshell.supervisor-middleware.external-http-exchange.v1"}, got.EnforcedCapabilities)
 	assert.Nil(t, PolicyStatusResultFromProto(&pb.GetSandboxPolicyStatusResponse{}).LoadedEnforcement)
 }

@@ -85,12 +85,11 @@ impl HttpMiddlewareExchange {
     ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
         let sandbox = openshell_ocsf::ctx::ctx();
         crate::l7::rest::HttpResponseMiddlewareRelay {
-            credential_connection: ctx.credential_connection.as_ref(),
+            exchange_connection: ctx.exchange_connection.as_ref(),
             upstream_transport: ctx.upstream_transport,
             chain: &self.chain,
             runner: &self.runner,
             request_context: openshell_core::proto::RequestContext {
-                verified_credential_connector: None,
                 request_id: self.request_id.clone(),
                 sandbox_id: sandbox.sandbox_id.clone(),
                 sandbox: sandbox.sandbox_name.clone(),
@@ -138,7 +137,7 @@ pub fn uninspectable_traffic_gate(
         return UninspectableTrafficGate::Unrestricted;
     }
     if chain.iter().all(|entry| {
-        !entry.credential_authority
+        !entry.external_http_exchange
             && entry.on_error == openshell_supervisor_middleware::OnError::FailOpen
     }) {
         UninspectableTrafficGate::BypassWithFinding
@@ -551,13 +550,13 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
-    if openshell_supervisor_middleware::credentials::has_credential_authority(&chain) {
+    if openshell_supervisor_middleware::external_exchange::has_external_http_exchange(&chain) {
         // Refuse unsupported transports before any request-time token grant or
         // legacy credential rewrite can run. Upgrades escape per-request checks.
         if ctx.upstream_transport != crate::l7::tls::UpstreamTransport::AuthenticatedTls
             || scheme != "https"
             || crate::l7::rest::request_has_upgrade_header(&req.raw_header)
-            || runner.credential_authority(&chain).await.is_err()
+            || runner.http_exchange_authority(&chain).await.is_err()
         {
             return Ok(MiddlewareApplyResult::Denied { denial: None });
         }

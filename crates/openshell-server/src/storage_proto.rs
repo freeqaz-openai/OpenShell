@@ -128,21 +128,18 @@ mod tests {
     // the additive file map while retaining the rest of the response.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
-    // The middleware credential-authority opt-in is additive: prior policy
+    // The middleware external-exchange opt-in is additive: prior policy
     // payloads decode false and require no storage rewrite. Protected installs
     // must independently negotiate the new extension capability.
     // LoadedEnforcementEvidence is additive to the durable admission. Prior
     // accepted admissions decode with no evidence and never qualify a protected
     // installation. The frozen storage.v1 closure itself is unchanged.
-    // CredentialConnector is an additive public/durable policy child. Empty
-    // old pins still decode, but cannot activate protected policy. The verified
-    // request proof belongs only to the supervisor-extension protocol closure.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "15dc041eea0577c329abfd7e4e86906238efc389a308354d22d419e6a8007f54";
+        "831d0b6ec2e9fd830109c3b027975d68e940a3157f6b542428e6d2dffbb9eb9e";
     const DURABLE_SCHEMA_SHA256: &str =
-        "7ba9f749d2859552c5152abf79ee560c14d906bf7158d9b3e6cc02af6f5a678a";
+        "71e70b986d2efe30864b693e6fd81f2c93a66e479e75a0359c9a3c5f1e8f924c";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "47244e0e14a2815f014e9d85917ea318fabcf3f3f6f2bc26c134181fd3ce62bb";
+        "efa85ba6e620c0ad3afc864ab7178e0addd4a1860b43f90d23ec32c7d2206bdf";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -496,13 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn prior_middleware_policy_does_not_opt_into_credential_authority() {
+    fn prior_middleware_policy_does_not_opt_into_external_http_exchange() {
         use openshell_core::proto::NetworkMiddlewareConfig;
 
         // Prior wire payload: field 2 (middleware) = "test/authority".
         let prior = NetworkMiddlewareConfig::decode(&b"\x12\x0etest/authority"[..]).unwrap();
         assert_eq!(prior.middleware, "test/authority");
-        assert!(!prior.credential_authority);
+        assert!(!prior.external_http_exchange);
     }
 
     #[test]
@@ -526,23 +523,6 @@ mod tests {
             (1, 7, 9)
         );
         assert!(admission.loaded_enforcement.is_none());
-    }
-
-    #[test]
-    fn prior_credential_messages_decode_without_connector_authority() {
-        // Pre-connector config: middleware="old", credential_authority=true.
-        let config = openshell_core::proto::NetworkMiddlewareConfig::decode(
-            b"\x12\x03old\x38\x01".as_slice(),
-        )
-        .unwrap();
-        assert_eq!(config.middleware, "old");
-        assert!(config.credential_authority);
-        assert!(config.credential_connectors.is_empty());
-        // Prior request context carries a request id but no verified leaf proof.
-        let context =
-            openshell_core::proto::RequestContext::decode(b"\x0a\x03old".as_slice()).unwrap();
-        assert_eq!(context.request_id, "old");
-        assert!(context.verified_credential_connector.is_none());
     }
 
     #[test]
@@ -600,9 +580,8 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            // HttpCredentialAccess adds two trusted supervisor-to-extension
-            // methods; neither is a public gateway or storage RPC.
-            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            // External HTTP exchange adds one supervisor-to-extension method.
+            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
@@ -659,9 +638,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (309, 27),
-                (95, 21),
-                (83, 21),
+                (307, 27),
+                (94, 21),
+                (82, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

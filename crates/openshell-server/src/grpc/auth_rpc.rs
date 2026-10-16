@@ -268,7 +268,7 @@ pub async fn handle_refresh_sandbox_token(
             policy
                 .network_middlewares
                 .values()
-                .any(|entry| entry.credential_authority)
+                .any(|entry| entry.external_http_exchange)
         });
         let instance_id =
             validated_extension_instance(&sandbox_record, &requested_instance, requires_instance)?;

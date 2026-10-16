@@ -2822,27 +2822,13 @@ message GetSandboxPolicyStatusResponse {
   uint32 active_version = 2;
   // Present only for the current authenticated supervisor registration and exact
   // effective configuration. LOADED alone never establishes capability support.
-  // Requires identical source and effective policies and hashes.
+  // Requires identical typed source and effective policies and hashes; even
+  // legitimate provider composition that changes the policy yields no evidence.
+  // Stock enforcement may omit an exchange key. External HTTP exchange requires
+  // the key from the current registration for the installed instance.
   LoadedEnforcementEvidence loaded_enforcement = 3;
-  // Current installation observation for identity composition or exactly one
-  // proven inert rule contributed by the sandbox's sole attached provider.
-  LoadedPolicyObservationV1 loaded_policy_observation = 4;
-}
-
-// Observation from a trusted registered supervisor, not attestation or a grant
-// to send traffic. Unknown policy derivations yield no observation.
-message LoadedPolicyObservationV1 {
-  // Canonical hash of the full queried source revision policy.
-  string source_policy_hash = 1;
-  openshell.sandbox.v1.SandboxPolicy effective_policy = 2;
-  // policy_hash identifies effective_policy, not the source revision.
-  LoadedEnforcementEvidence enforcement = 3;
-  // Empty for identity composition. Otherwise the exact provider-derived map
-  // key of the sole extra rule: name equals that key, every other typed field
-  // is default, and removing it yields the full source policy exactly.
-  string inert_provider_rule = 4;
-  // From the gateway-owned current supervisor session, not the policy-status caller.
-  bytes registered_exchange_public_key = 5;
+  reserved 4;
+  reserved "loaded_policy_observation";
 }
 
 // List sandbox policies request.
@@ -2901,21 +2887,8 @@ message SandboxConfigurationAdmission {
   string error = 7;
   // Supervisor-produced evidence, emitted only after actual runtime installation.
   // Absent on older supervisors and on pending/rejected configurations.
+  // Reporters must leave registered_exchange_public_key empty.
   LoadedEnforcementEvidence loaded_enforcement = 8;
-}
-
-// Positive runtime enforcement evidence, bound to the existing configuration
-// registration fence. This is an installation observation, not an authorization
-// lease or a provider-effect receipt. Consumers must query current evidence.
-message LoadedEnforcementEvidence {
-  string sandbox_id = 1;
-  string instance_id = 2;
-  uint32 policy_version = 3;
-  string policy_hash = 4;
-  // Includes the installed operator middleware registry configuration.
-  uint64 config_revision = 5;
-  uint64 provider_env_revision = 6;
-  repeated string enforced_capabilities = 7;
 }
 
 message ReportSandboxConfigurationRequest {
@@ -3850,4 +3823,23 @@ enum ServiceAuthorizationMode {
   SERVICE_AUTHORIZATION_MODE_STRIP = 1;
   // Forward one syntactically valid bearer Authorization header unchanged.
   SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH = 2;
+}
+
+// Positive runtime enforcement evidence, bound to the existing configuration
+// registration fence. This is an installation observation, not an authorization
+// lease or a provider-effect receipt. Consumers must query current evidence.
+message LoadedEnforcementEvidence {
+  string sandbox_id = 1;
+  string instance_id = 2;
+  uint32 policy_version = 3;
+  string policy_hash = 4;
+  // Includes the installed operator middleware registry configuration.
+  uint64 config_revision = 5;
+  uint64 provider_env_revision = 6;
+  repeated string enforced_capabilities = 7;
+  // Output-only in GetSandboxPolicyStatusResponse: supplied by the gateway from
+  // the current authenticated supervisor registration for instance_id, never
+  // by the reporter. Empty for stock enforcement without an exchange key.
+  // External HTTP exchange evidence requires this current registered key.
+  bytes registered_exchange_public_key = 8;
 }

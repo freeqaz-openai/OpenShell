@@ -421,7 +421,7 @@ impl ExtensionJwtIssuer {
             exchange_key: exchange_key
                 .filter(|key| key.len() == 32 && instance_id.is_some())
                 .map(|key| openshell_extension_core::ExchangeKey {
-                    profile: "openshell-exchange-v1".to_string(),
+                    profile: openshell_extension_core::HTTP_EXCHANGE_KEY_PROFILE.to_string(),
                     kty: "OKP".to_string(),
                     crv: "Ed25519".to_string(),
                     x: URL_SAFE_NO_PAD.encode(key),

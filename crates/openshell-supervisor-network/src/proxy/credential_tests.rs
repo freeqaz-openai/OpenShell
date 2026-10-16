@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Synthetic trusted backend inputs, using the real procfs executable resolver.
-//! No post-connect socket-owner lookup is accepted as credential provenance.
+//! External exchange admission through the trusted blocked-connect boundary.
 use super::*;
 use openshell_core::proposals::AgentProposals;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-fn resolve(pid: u32) -> ContractBinaryIdentity {
+pub(super) fn resolve(pid: u32) -> ContractBinaryIdentity {
     static RESOLVER: std::sync::OnceLock<openshell_binary_identity::ProcfsIdentityResolver> =
         std::sync::OnceLock::new();
     RESOLVER
@@ -18,7 +17,7 @@ fn resolve(pid: u32) -> ContractBinaryIdentity {
         .unwrap()
 }
 
-async fn admit(
+pub(super) async fn admit(
     stream: BoundaryDuplexStream,
     engine: &OpaEngine,
     host: &str,
@@ -95,10 +94,10 @@ async fn admit(
     (admitted, completion.await.unwrap())
 }
 
-pub(crate) async fn admit_test_credential_connection(
+pub(crate) async fn admit_test_exchange_connection(
     engine: &OpaEngine,
     host: &str,
-) -> crate::opa::CredentialConnection {
+) -> crate::opa::ExchangeConnection {
     let (stream, _peer) = tokio::io::duplex(4096);
     let (admitted, decision) = admit(
         Box::new(stream),
@@ -116,7 +115,7 @@ pub(crate) async fn admit_test_credential_connection(
         .unwrap()
         .0
         .endpoint
-        .credential_connection
+        .exchange_connection
         .unwrap()
 }
 
@@ -124,12 +123,21 @@ pub(crate) async fn handle_test_transparent_connection(
     stream: BoundaryDuplexStream,
     engine: Arc<OpaEngine>,
     tls: Option<Arc<ProxyTlsState>>,
-    upstream: Option<UpstreamProxyConfig>,
+    origin: SocketAddr,
     host: &str,
 ) -> Result<()> {
     let (admitted, decision) = admit(stream, &engine, host, Ok(resolve(std::process::id()))).await;
     assert_eq!(decision, TcpOpenDecision::RelayReady);
-    let (stream, identity, addrs, transparent) = admitted.unwrap();
+    let (stream, identity, addrs, mut transparent) = admitted.unwrap();
+    // Substitute only the dial address after real blocked-connect admission.
+    // TLS still verifies the admitted host; no upstream-proxy bypass is enabled.
+    let (_, connector) = transparent
+        .as_mut()
+        .unwrap()
+        .authorization
+        .as_mut()
+        .unwrap();
+    *connector = destination::UpstreamConnector::new(host, 443, vec![origin]);
     handle_mediated_connection(
         tokio::io::BufReader::new(stream),
         identity,
@@ -144,7 +152,7 @@ pub(crate) async fn handle_test_transparent_connection(
         AgentProposals::default(),
         Arc::new(None),
         Arc::new(None),
-        Arc::new(upstream),
+        Arc::new(None),
         None,
         None,
         None,
@@ -155,180 +163,149 @@ pub(crate) async fn handle_test_transparent_connection(
     .await
 }
 
-fn policy() -> openshell_core::proto::SandboxPolicy {
-    use sha2::{Digest, Sha256};
-    let path = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-    let digest = hex::encode(Sha256::digest(std::fs::read(&path).unwrap()));
-    let path = serde_json::to_string(&path).unwrap();
-    openshell_policy::parse_sandbox_policy(&format!(
+pub(super) fn policy() -> openshell_core::proto::SandboxPolicy {
+    openshell_policy::parse_sandbox_policy(
         r#"
 version: 1
 network_middlewares:
   protected:
     middleware: test/authority
-    credential_authority: true
-    credential_connectors: [{{ path: {path}, sha256: "{digest}" }}]
-    endpoints: {{ include: ["203.0.113.10"] }}
+    external_http_exchange: true
+    endpoints: { include: ["203.0.113.10"] }
 network_policies:
   provider:
-    endpoints: [{{ host: "203.0.113.10", port: 443 }}]
-    binaries: [{{ path: {path} }}]
-"#
-    ))
+    endpoints:
+      - host: "203.0.113.10"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /admitted }
+"#,
+    )
     .unwrap()
 }
 
 #[tokio::test]
-async fn transparent_credential_parent_admitted_child_denied_despite_ancestor_and_weaker_route() {
-    let parent = resolve(std::process::id());
-    let mut child = tokio::process::Command::new("/usr/bin/sleep")
-        .arg("30")
-        .kill_on_drop(true)
-        .spawn()
+async fn external_exchange_live_policy_selection_and_generation_binding() {
+    let protected = policy();
+    let engine = OpaEngine::from_proto(&protected).unwrap();
+    let connection = admit_test_exchange_connection(&engine, "203.0.113.10").await;
+    let guard = engine
+        .generation_guard(engine.current_generation())
         .unwrap();
-    let child_identity = resolve(child.id().unwrap());
-    assert_eq!(
-        child_identity.executable.path,
-        std::fs::canonicalize("/usr/bin/sleep").unwrap()
-    );
+    let proof = connection.proof_for("203.0.113.10", 443, &guard).unwrap();
+    assert!(!proof.policy_hash.is_empty());
+    assert!(connection.proof_for("203.0.113.11", 443, &guard).is_err());
+    assert!(connection.proof_for("203.0.113.10", 444, &guard).is_err());
+    let unrelated = OpaEngine::from_proto(&protected).unwrap();
     assert!(
-        child_identity
-            .ancestors
-            .iter()
-            .any(|a| a.path == parent.executable.path)
+        connection
+            .proof_for(
+                "203.0.113.10",
+                443,
+                &unrelated
+                    .generation_guard(unrelated.current_generation())
+                    .unwrap()
+            )
+            .is_err()
     );
-    let mut protected = policy();
-    // Show that the actual ancestor rule admits the child without credentials.
-    let mut ordinary = protected.clone();
-    ordinary.network_middlewares.clear();
-    let cache = BinaryIdentityCache::new();
-    let intent = || EgressIntent::connect("203.0.113.10".into(), 443);
-    assert!(matches!(
-        authorize_supplied_identity(
-            &OpaEngine::from_proto(&ordinary).unwrap(),
-            &cache,
-            intent(),
-            &Ok(child_identity.clone())
-        )
-        .action,
-        NetworkAction::Allow { .. }
-    ));
-    // An additional route directly admits the child too; protected selection
-    // must remain independent of which ordinary policy wins.
-    let mut weak = protected.network_policies["provider"].clone();
-    weak.name = "weak".into();
-    weak.binaries[0].path = child_identity
-        .executable
-        .path
-        .to_string_lossy()
-        .into_owned();
-    protected.network_policies.insert("weak".into(), weak);
-    {
-        let engine = OpaEngine::from_proto(&protected).unwrap();
-        let (stream, mut peer) = tokio::io::duplex(4096);
-        let (tuple, completion) = admit(
-            Box::new(stream),
-            &engine,
-            "203.0.113.10",
-            Ok(child_identity.clone()),
-        )
-        .await;
-        assert_eq!(
-            completion,
-            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
-        );
-        assert!(
-            tuple.is_none(),
-            "denied child cannot be dispatched or access credentials"
-        );
-        assert_eq!(
-            peer.read_u8().await.unwrap_err().kind(),
-            std::io::ErrorKind::UnexpectedEof
-        );
-        let connection = admit_test_credential_connection(&engine, "203.0.113.10").await;
-        let guard = engine
-            .generation_guard(engine.current_generation())
-            .unwrap();
-        let proof = connection.proof_for("203.0.113.10", 443, &guard).unwrap();
-        let openshell_core::middleware::VerifiedCredentialOrigin::Connector(proof) = proof else {
-            panic!("old grant broadened");
-        };
-        assert_eq!(proof.path, parent.executable.path.to_string_lossy());
-        assert_eq!(proof.sha256, parent.executable.digest.unwrap().to_string());
-        assert!(connection.proof_for("203.0.113.11", 443, &guard).is_err());
-        assert!(connection.proof_for("203.0.113.10", 444, &guard).is_err());
-    }
-    child.kill().await.unwrap();
-    child.wait().await.unwrap();
+
+    let mut stock = protected.clone();
+    stock.network_middlewares.clear();
+    stock
+        .network_policies
+        .get_mut("provider")
+        .unwrap()
+        .binaries
+        .push(openshell_core::proto::NetworkBinary {
+            path: resolve(std::process::id())
+                .executable
+                .path
+                .to_string_lossy()
+                .into_owned(),
+        });
+    engine.reload_from_proto(&stock).unwrap();
+    assert!(connection.proof_for("203.0.113.10", 443, &guard).is_err());
+    let (stream, _peer) = tokio::io::duplex(4096);
+    let (accepted, decision) = admit(
+        Box::new(stream),
+        &engine,
+        "203.0.113.10",
+        Ok(resolve(std::process::id())),
+    )
+    .await;
+    assert_eq!(decision, TcpOpenDecision::RelayReady);
+    assert!(
+        accepted
+            .unwrap()
+            .3
+            .unwrap()
+            .authorization
+            .unwrap()
+            .0
+            .endpoint
+            .exchange_connection
+            .is_none()
+    );
+    engine.reload_from_proto(&protected).unwrap();
+    admit_test_exchange_connection(&engine, "203.0.113.10").await;
 }
 
 #[tokio::test]
-async fn transparent_credential_substituted_missing_and_ambiguous_pins_deny_before_dispatch() {
-    let identity = resolve(std::process::id());
-    for variant in 0..4 {
+async fn external_exchange_rejects_weak_conflicted_routes_and_unverified_source() {
+    for variant in 0..7 {
         let mut policy = policy();
+        let endpoint = &mut policy
+            .network_policies
+            .get_mut("provider")
+            .unwrap()
+            .endpoints[0];
         match variant {
-            0 => {
-                policy
-                    .network_middlewares
-                    .get_mut("protected")
-                    .unwrap()
-                    .credential_connectors[0]
-                    .path = "/different/client".into()
+            0 => endpoint.protocol = "tcp".into(),
+            1 => endpoint.enforcement = openshell_core::proto::NetworkEnforcementMode::Audit as i32,
+            2 => endpoint.rules.clear(),
+            3 => endpoint.access = openshell_core::proto::NetworkAccessPreset::Full as i32,
+            4 => {
+                // A separately pinned L4 route must not escape the exchange guard.
+                let mut weak = policy.network_policies["provider"].clone();
+                weak.endpoints[0].protocol.clear();
+                weak.endpoints[0].rules.clear();
+                weak.binaries.push(openshell_core::proto::NetworkBinary {
+                    path: "/other/process".into(),
+                });
+                policy.network_policies.insert("weak".into(), weak);
             }
-            1 => {
+            5 => {
+                let mut duplicate = policy.network_middlewares["protected"].clone();
+                duplicate.order = 1;
                 policy
                     .network_middlewares
-                    .get_mut("protected")
-                    .unwrap()
-                    .credential_connectors[0]
-                    .sha256 = "b".repeat(64)
-            }
-            2 => {
-                let mut second = policy.network_middlewares["protected"].clone();
-                second.order = 1;
-                policy
-                    .network_middlewares
-                    .insert("ambiguous".into(), second);
+                    .insert("duplicate".into(), duplicate);
             }
             _ => {}
         }
-        let engine = OpaEngine::from_proto(&policy).unwrap();
+        // Typed validation may reject malformed variants before admission.
+        let Ok(engine) = OpaEngine::from_proto(&policy) else {
+            continue;
+        };
         let (stream, _peer) = tokio::io::duplex(4096);
-        let supplied = if variant == 3 {
+        let identity = if variant == 6 {
             Err(ResolveError::Failed("unverified".into()))
         } else {
-            Ok(identity.clone())
+            Ok(resolve(std::process::id()))
         };
-        let (tuple, completion) = admit(Box::new(stream), &engine, "203.0.113.10", supplied).await;
-        assert!(tuple.is_none());
-        assert_eq!(
-            completion,
-            TcpOpenDecision::Denied(if variant == 3 {
-                TcpOpenDenial::IdentityUnavailable
-            } else {
-                TcpOpenDenial::PolicyDenied
-            })
+        let (accepted, decision) = admit(Box::new(stream), &engine, "203.0.113.10", identity).await;
+        assert!(accepted.is_none(), "variant {variant}");
+        assert!(
+            matches!(decision, TcpOpenDecision::Denied(_)),
+            "variant {variant}"
         );
-    }
-    for malformed in [false, true] {
-        let mut policy = policy();
-        let pins = &mut policy
-            .network_middlewares
-            .get_mut("protected")
-            .unwrap()
-            .credential_connectors;
-        if malformed {
-            pins[0].sha256 = "NOT_A_DIGEST".into();
-        } else {
-            pins.clear();
-        }
-        assert!(OpaEngine::from_proto(&policy).is_err());
     }
 }
 
 #[tokio::test]
-async fn explicit_connect_legacy_and_host_exact_pinned_identity_cannot_mint() {
+async fn external_exchange_explicit_connect_legacy_and_host_identity_cannot_mint() {
     let engine = Arc::new(OpaEngine::from_proto(&policy()).unwrap());
     let identity = resolve(std::process::id());
     for mode in 0..3 {
@@ -349,7 +326,7 @@ async fn explicit_connect_legacy_and_host_exact_pinned_identity_cannot_mint() {
             );
             assert_eq!(decision.binary.as_ref(), Some(&identity.executable.path));
             assert!(matches!(decision.action, NetworkAction::Deny { .. }));
-            assert!(decision.endpoint.credential_connection.is_none());
+            assert!(decision.endpoint.exchange_connection.is_none());
         } else {
             let decision = authorize_supplied_identity(
                 &engine,
@@ -358,7 +335,7 @@ async fn explicit_connect_legacy_and_host_exact_pinned_identity_cannot_mint() {
                 &Ok(identity.clone()),
             );
             assert!(matches!(decision.action, NetworkAction::Deny { .. }));
-            assert!(decision.endpoint.credential_connection.is_none());
+            assert!(decision.endpoint.exchange_connection.is_none());
         }
         workload
             .write_all(b"CONNECT 203.0.113.10:443 HTTP/1.1\r\nHost: 203.0.113.10:443\r\n\r\n")

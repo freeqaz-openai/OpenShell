@@ -1734,8 +1734,7 @@ mod tests {
 
     fn entry(on_error: OnError) -> ChainEntry {
         ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/response".into(),
             order: 0,
@@ -1746,8 +1745,7 @@ mod tests {
 
     fn configured_entry(name: &str, order: i32, mode: &str) -> ChainEntry {
         ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: name.into(),
             implementation: "test/response".into(),
             order,
@@ -1769,8 +1767,7 @@ mod tests {
             kind: Some(prost_types::value::Kind::StringValue(value.into())),
         };
         ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: name.into(),
             implementation: "test/preflight-lifecycle".into(),
             order,
@@ -2596,8 +2593,7 @@ mod tests {
         let outcome = runner
             .preflight_http_response(
                 &[ChainEntry {
-                    credential_authority: false,
-                    execution_authority: false,
+                    external_http_exchange: false,
                     name: "response".into(),
                     implementation: "remote-response".into(),
                     order: 0,

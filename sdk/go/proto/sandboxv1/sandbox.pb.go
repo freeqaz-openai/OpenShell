@@ -634,14 +634,10 @@ type NetworkMiddlewareConfig struct {
 	// Host selector controlling which admitted destinations use this config.
 	Endpoints *MiddlewareEndpointSelector `protobuf:"bytes,5,opt,name=endpoints,proto3" json:"endpoints,omitempty"`
 	// Execution order. Values must be unique within a policy; lower values run first.
-	Order int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
-	// Use this service as the exclusive per-request STATIC credential authority.
-	// Requires authenticated TLS, HTTP_CREDENTIALS/PRE_CREDENTIALS and
-	// HTTP_RESPONSE/PRE_RETURN bindings, and fail_closed. No legacy credential
-	// resolution or token grant is attempted for a selected protected request.
-	CredentialAuthority bool `protobuf:"varint,7,opt,name=credential_authority,json=credentialAuthority,proto3" json:"credential_authority,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	Order                int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
+	ExternalHttpExchange bool  `protobuf:"varint,10,opt,name=external_http_exchange,json=externalHttpExchange,proto3" json:"external_http_exchange,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NetworkMiddlewareConfig) Reset() {
@@ -716,9 +712,9 @@ func (x *NetworkMiddlewareConfig) GetOrder() int32 {
 	return 0
 }
 
-func (x *NetworkMiddlewareConfig) GetCredentialAuthority() bool {
+func (x *NetworkMiddlewareConfig) GetExternalHttpExchange() bool {
 	if x != nil {
-		return x.CredentialAuthority
+		return x.ExternalHttpExchange
 	}
 	return false
 }
@@ -853,7 +849,6 @@ type NetworkEndpoint struct {
 	// When non-empty, the SSRF internal-IP check is replaced by an allowlist check:
 	//   - If host is also set: domain must resolve to an IP in this list.
 	//   - If host is empty: any domain is allowed as long as it resolves to an IP in this list.
-	//
 	// Supports exact IPs ("10.0.5.20") and CIDR notation ("10.0.5.0/24").
 	// Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) are always blocked
 	// regardless of this field.
@@ -2329,7 +2324,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +
-	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xb2\x02\n" +
+	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\x89\x03\n" +
 	"\x17NetworkMiddlewareConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1e\n" +
 	"\n" +
@@ -2338,8 +2333,10 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x06config\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x06config\x12\x19\n" +
 	"\bon_error\x18\x04 \x01(\tR\aonError\x12N\n" +
 	"\tendpoints\x18\x05 \x01(\v20.openshell.sandbox.v1.MiddlewareEndpointSelectorR\tendpoints\x12\x14\n" +
-	"\x05order\x18\x06 \x01(\x05R\x05order\x121\n" +
-	"\x14credential_authority\x18\a \x01(\bR\x13credentialAuthority\"P\n" +
+	"\x05order\x18\x06 \x01(\x05R\x05order\x124\n" +
+	"\x16external_http_exchange\x18\n" +
+	" \x01(\bR\x14externalHttpExchangeJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	"R\x14credential_authorityR\x15credential_connectorsR\x13execution_authority\"P\n" +
 	"\x1aMiddlewareEndpointSelector\x12\x18\n" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +

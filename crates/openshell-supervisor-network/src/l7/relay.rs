@@ -41,7 +41,7 @@ const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct L7EvalContext {
-    pub(crate) credential_connection: Option<crate::opa::CredentialConnection>,
+    pub(crate) exchange_connection: Option<crate::opa::ExchangeConnection>,
     /// Host from the CONNECT request.
     pub host: String,
     /// Port from the CONNECT request.
@@ -126,7 +126,7 @@ fn scoped_context_for_middleware_request(
     request: &crate::l7::provider::L7Request,
     chain: &[openshell_supervisor_middleware::ChainEntry],
 ) -> Option<L7EvalContext> {
-    if openshell_supervisor_middleware::credentials::has_credential_authority(chain) {
+    if openshell_supervisor_middleware::external_exchange::has_external_http_exchange(chain) {
         // The external authority owns selection. Do not even construct a
         // request-scoped snapshot from the legacy provider credential cache.
         None
@@ -647,12 +647,11 @@ pub(crate) fn http_response_middleware_relay<'a>(
 ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
     let sandbox = openshell_ocsf::ctx::ctx();
     crate::l7::rest::HttpResponseMiddlewareRelay {
-        credential_connection: ctx.credential_connection.as_ref(),
+        exchange_connection: ctx.exchange_connection.as_ref(),
         upstream_transport: ctx.upstream_transport,
         chain,
         runner,
         request_context: openshell_core::proto::RequestContext {
-            verified_credential_connector: None,
             request_id: request_id.to_string(),
             sandbox_id: sandbox.sandbox_id.clone(),
             sandbox: sandbox.sandbox_name.clone(),
@@ -975,7 +974,7 @@ where
         // provider lookup can select state from another installation.
         let mut accepted = super::rest::AcceptedResponseSink::capture(
             client,
-            ctx.credential_connection.is_some(),
+            ctx.exchange_connection.is_some(),
         )?;
         let client = accepted.client();
         let observation_context = ctx
@@ -1362,13 +1361,14 @@ where
                 engine.middleware_runner(),
                 Some(engine.generation_guard()),
             );
-            if openshell_supervisor_middleware::credentials::has_credential_authority(
-                &response_chain,
-            ) {
-                // Complete custody is terminal: this sink, operation and permit cannot be rebound or reused.
-                accepted
-                    .relay(&req, upstream, options, middleware, observer.as_ref())
-                    .await?;
+            if ctx.exchange_connection.is_some()
+                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
+                    &response_chain,
+                )
+            {
+                // L4 protection is terminal even if L7 selection is missing. The
+                // protected relay has no upstream socket and cannot fall back.
+                accepted.relay(&req, options, middleware).await?;
                 return Ok(());
             }
             let client = accepted.client();
@@ -1892,7 +1892,7 @@ where
         // Parse one HTTP request from client
         let mut accepted = super::rest::AcceptedResponseSink::capture(
             client,
-            ctx.credential_connection.is_some(),
+            ctx.exchange_connection.is_some(),
         )?;
         let client = accepted.client();
         let req = match provider.parse_request(client).await {
@@ -2110,26 +2110,26 @@ where
             } else {
                 None
             };
-            let req_with_auth =
-                match if openshell_supervisor_middleware::credentials::has_credential_authority(
+            let req_with_auth = match if ctx.exchange_connection.is_some()
+                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
                     &response_chain,
                 ) {
-                    Ok(req)
-                } else {
-                    crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
-                } {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
+                Ok(req)
+            } else {
+                crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
+            } {
+                Ok(req) => req,
+                Err(e) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "Token grant failed in L7 relay"
+                    );
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+            };
             let scoped_ctx =
                 scoped_context_for_middleware_request(ctx, &req_with_auth, &response_chain);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
@@ -2164,13 +2164,12 @@ where
                 engine.middleware_runner(),
                 Some(engine.generation_guard()),
             );
-            if openshell_supervisor_middleware::credentials::has_credential_authority(
-                &response_chain,
-            ) {
-                // Complete custody is terminal: this sink, operation and permit cannot be rebound or reused.
-                accepted
-                    .relay(&req_with_auth, upstream, options, middleware, None)
-                    .await?;
+            if ctx.exchange_connection.is_some()
+                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
+                    &response_chain,
+                )
+            {
+                accepted.relay(&req_with_auth, options, middleware).await?;
                 return Ok(());
             }
             let client = accepted.client();
@@ -3341,9 +3340,8 @@ fn evaluate_l7_request_once(
         }
     });
 
-    if let Some(connection) = &ctx.credential_connection
-        && connection.is_execution_for(&ctx.host, ctx.port, engine.generation_guard())?
-    {
+    if let Some(connection) = &ctx.exchange_connection {
+        connection.proof_for(&ctx.host, ctx.port, engine.generation_guard())?;
         input["network"]["verified_execution_connect"] = true.into();
     }
 
@@ -6243,8 +6241,7 @@ network_policies:
             body_length: crate::l7::provider::BodyLength::None,
         };
         let fail_open = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "m".into(),
             implementation: "openshell/regex".into(),
             order: 0,
@@ -6290,8 +6287,7 @@ network_policies:
         use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
 
         let resolved = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "redact".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -6299,8 +6295,7 @@ network_policies:
             on_error: OnError::FailClosed,
         };
         let unresolved = ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -6940,8 +6935,7 @@ network_policies:
         use openshell_supervisor_middleware::{ChainEntry, OnError};
 
         let entry = |on_error| ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "m".into(),
             implementation: "example/guard".into(),
             order: 0,
@@ -7052,8 +7046,7 @@ network_policies:
         let runner = ChainRunner::from_registry(registry);
         let chain = vec![
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "redact".into(),
                 implementation: "test/redactor".into(),
                 order: 0,
@@ -7061,8 +7054,7 @@ network_policies:
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
-                credential_authority: false,
-                execution_authority: false,
+                external_http_exchange: false,
                 name: "guard".into(),
                 implementation: "test/guard".into(),
                 order: 10,

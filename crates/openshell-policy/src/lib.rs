@@ -2053,6 +2053,20 @@ network_policies:
     }
 
     #[test]
+    fn external_exchange_rejects_obsolete_pinned_grants() {
+        for field in [
+            "credential_authority: true",
+            "execution_authority: true",
+            "credential_connectors: [{path: /bin/client, sha256: aaaa}]",
+        ] {
+            let yaml = format!(
+                "version: 1\nnetwork_middlewares:\n  authority:\n    middleware: test/authority\n    external_http_exchange: true\n    {field}\n    endpoints: {{include: [api.example.com]}}\n"
+            );
+            assert!(parse_sandbox_policy(&yaml).is_err(), "{field}");
+        }
+    }
+
+    #[test]
     fn round_trip_preserves_network_middlewares() {
         let yaml = r#"
 version: 1
@@ -2069,10 +2083,7 @@ network_middlewares:
       mode: redact
   secondary-redactor:
     middleware: openshell/regex
-    credential_authority: true
-    credential_connectors:
-      - path: /usr/bin/curl
-        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    external_http_exchange: true
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -2087,7 +2098,7 @@ network_policies:
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto.network_middlewares.len(), 2);
-        assert!(proto.network_middlewares["secondary-redactor"].credential_authority);
+        assert!(proto.network_middlewares["secondary-redactor"].external_http_exchange);
         let redactor = &proto.network_middlewares["global-redactor"];
         assert_eq!(redactor.name, "Global redactor");
         assert_eq!(redactor.middleware, "openshell/regex");
@@ -2939,9 +2950,7 @@ network_policies:
 
     fn middleware_config(implementation: &str) -> openshell_core::proto::NetworkMiddlewareConfig {
         openshell_core::proto::NetworkMiddlewareConfig {
-            credential_connectors: Vec::new(),
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: String::new(),
             middleware: implementation.into(),
             order: 0,

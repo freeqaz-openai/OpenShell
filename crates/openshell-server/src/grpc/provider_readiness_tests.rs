@@ -17,7 +17,7 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct TestRegistry(crate::supervisor_session::SupervisorSessionRegistry);
 
-fn register_session(
+pub(crate) fn register_session(
     registry: &crate::supervisor_session::SupervisorSessionRegistry,
     hello: &SupervisorHello,
 ) -> Result<String, Status> {

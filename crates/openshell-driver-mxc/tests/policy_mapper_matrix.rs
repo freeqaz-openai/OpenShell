@@ -37,9 +37,7 @@ use serde_json::Value;
 
 fn middleware_config() -> NetworkMiddlewareConfig {
     NetworkMiddlewareConfig {
-        credential_connectors: Vec::new(),
-        credential_authority: false,
-        execution_authority: false,
+        external_http_exchange: false,
         name: "redactor".into(),
         middleware: "openshell/regex".into(),
         config: None,

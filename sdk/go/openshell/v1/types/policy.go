@@ -142,9 +142,10 @@ type NetworkMiddlewareConfig struct {
 	OnError    string
 	Endpoints  *MiddlewareEndpointSelector
 	Order      int32
-	// CredentialAuthority selects an exclusive authenticated STATIC credential authority.
-	// The attachment must be fail_closed and support the credential-access protocol.
-	CredentialAuthority bool
+	// ExternalHttpExchange delegates admitted HTTPS REST requests, including allowed
+	// URL, headers and body, to the named installation-admin authority for all
+	// qualifying workload processes in this sandbox. Requires fail_closed.
+	ExternalHttpExchange bool
 }
 
 // MiddlewareEndpointSelector controls which admitted destinations use a

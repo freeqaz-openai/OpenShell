@@ -14,7 +14,7 @@ mod transport;
 
 pub use auth::{BearerTokenInterceptor, BearerTokenSlot, TokenSlotError};
 pub use identity::{ExtensionAudience, ExtensionIdentity, ExtensionKind, IdentityError};
-pub use installation::{InstallationSigningKey, new_response_custody};
+pub use installation::{HTTP_EXCHANGE_KEY_PROFILE, InstallationSigningKey, new_response_custody};
 pub use jwt::{
     EXTENSION_JWT_TYP, ExchangeKey, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,

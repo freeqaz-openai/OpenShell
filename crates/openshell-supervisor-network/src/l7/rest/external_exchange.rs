@@ -1,29 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded HTTPS forwarding with an exclusive external STATIC authority.
+//! Terminal external HTTP exchange. The origin socket never receives HTTP bytes.
 
 use futures::FutureExt;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::proto::{HttpHeader, HttpRequestEvaluation, SupervisorMiddlewarePhase};
 use openshell_core::secrets::contains_reserved_credential_marker_bytes;
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
-use openshell_supervisor_middleware::credentials::{
-    MAX_CREDENTIAL_OPERATION_TIME, is_credential_header,
-};
+use openshell_supervisor_middleware::external_exchange::MAX_HTTP_EXCHANGE_OPERATION_TIME;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zeroize::Zeroizing;
 
 use super::{
-    BufferResult, EndpointObserver, HttpResponseMiddlewareRelay, L7Request, ObservedUpstream,
-    RelayOutcome, RelayRequestOptions, buffer_request_body_for_middleware,
-    http_response::{capture_custody_response, frame_custody_response},
-    rebuild_request_with_buffered_body, request_authority, request_has_upgrade_header,
-    strip_connection_nominated_headers, strip_header,
+    BufferResult, HttpResponseMiddlewareRelay, L7Request, RelayOutcome, RelayRequestOptions,
+    buffer_request_body_for_middleware, request_authority, request_has_upgrade_header,
+    strip_connection_nominated_headers,
 };
 
 const MAX_PROTECTED_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -53,63 +46,48 @@ impl<'a, C: AsyncRead + AsyncWrite + Unpin> AcceptedResponseSink<'a, C> {
         self.downstream
     }
 
-    pub(crate) async fn relay<U: AsyncRead + AsyncWrite + Unpin>(
+    pub(crate) async fn relay(
         self,
         req: &L7Request,
-        upstream: &mut U,
         options: RelayRequestOptions<'_>,
         middleware: HttpResponseMiddlewareRelay<'_>,
-        observer: Option<&EndpointObserver>,
     ) -> Result<RelayOutcome> {
         let custody = self
             .custody
             .ok_or_else(|| miette!("protected operation lacks an accepted response stream"))?;
         // Keep complete protected-response custody off the ordinary per-connection future stack.
-        Box::pin(relay(
-            req,
-            self.downstream,
-            custody,
-            upstream,
-            options,
-            middleware,
-            observer,
-        ))
-        .await
+        Box::pin(relay(req, self.downstream, custody, options, middleware)).await
     }
 }
 
-async fn relay<C, U>(
+async fn relay<C>(
     req: &L7Request,
     client: &mut C,
     custody: [u8; 32],
-    upstream: &mut U,
     options: RelayRequestOptions<'_>,
     middleware: HttpResponseMiddlewareRelay<'_>,
-    observer: Option<&EndpointObserver>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
 {
     let now = SystemTime::now();
-    let deadline = openshell_core::middleware::http_credential_operation_horizon(
+    let deadline = openshell_core::middleware::http_exchange_operation_horizon(
         &middleware.request_context.request_id,
         now,
     )
     .map_or(now, |horizon| {
-        horizon.min(now + MAX_CREDENTIAL_OPERATION_TIME)
+        horizon.min(now + MAX_HTTP_EXCHANGE_OPERATION_TIME)
     });
     let operation_end =
         tokio::time::Instant::now() + deadline.duration_since(now).unwrap_or_default();
-    let upstream = &mut ObservedUpstream { upstream, observer };
     let request_id = middleware.request_context.request_id.clone();
     let mut progress = CustodyProgress {
         request_id: &request_id,
-        permit_accepted: false,
+        opening_started: false,
         delivery_started: false,
         released: false,
     };
-    let mut dispatch_started = false;
+    let mut opening_started_remote = false;
     let policy_name = middleware.policy_name;
     let host = middleware.target.host.clone();
     let port = u16::try_from(middleware.target.port).unwrap_or_default();
@@ -118,21 +96,19 @@ where
         exchange(
             req,
             client,
-            upstream,
             options,
             middleware,
-            observer,
             deadline,
             custody,
             &mut progress,
-            &mut dispatch_started,
+            &mut opening_started_remote,
         ),
     )
     .await;
     if let Ok(Ok(outcome)) = result {
         Ok(outcome)
     } else {
-        // No raw authority, provider, selected material, or evidence diagnostics.
+        // No raw authority or provider diagnostics.
         // The business send may already have happened; never retry this exchange.
         use openshell_ocsf::{
             ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
@@ -140,7 +116,7 @@ where
         };
         let event = HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Other)
-            .action(if dispatch_started {
+            .action(if opening_started_remote {
                 ActionId::Other
             } else {
                 ActionId::Denied
@@ -159,8 +135,8 @@ where
                 },
             ))
             .dst_endpoint(Endpoint::from_domain(&host, port))
-            .firewall_rule(policy_name, "credential-authority")
-            .message(if dispatch_started {
+            .firewall_rule(policy_name, "external-http-exchange")
+            .message(if opening_started_remote {
                 "Protected HTTP exchange failed after possible dispatch"
             } else {
                 "Protected HTTP exchange refused before dispatch"
@@ -174,17 +150,16 @@ where
                 client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
                 client.flush().await?;
             }
-            client.shutdown().await?;
-            upstream.shutdown().await
+            client.shutdown().await
         }).await;
         Ok(RelayOutcome::Consumed)
     }
 }
 
-/// Content-free finite transitions; cancellations and timeouts cannot silently become permits.
+/// Content-free finite transitions; cancellations and timeouts cannot silently become successful exchanges.
 struct CustodyProgress<'a> {
     request_id: &'a str,
-    permit_accepted: bool,
+    opening_started: bool,
     delivery_started: bool,
     released: bool,
 }
@@ -205,8 +180,8 @@ impl CustodyProgress<'_> {
 
 impl Drop for CustodyProgress<'_> {
     fn drop(&mut self) {
-        if !self.permit_accepted {
-            self.event("no_permit");
+        if !self.opening_started {
+            self.event("exchange_not_started");
         }
         if !self.released {
             self.event(if self.delivery_started {
@@ -219,21 +194,18 @@ impl Drop for CustodyProgress<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn exchange<C, U>(
+async fn exchange<C>(
     req: &L7Request,
     client: &mut C,
-    upstream: &mut U,
     options: RelayRequestOptions<'_>,
     middleware: HttpResponseMiddlewareRelay<'_>,
-    observer: Option<&EndpointObserver>,
     deadline: SystemTime,
     custody: [u8; 32],
     progress: &mut CustodyProgress<'_>,
-    dispatch_started: &mut bool,
+    opening_started_remote: &mut bool,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
 {
     if middleware.upstream_transport != crate::l7::tls::UpstreamTransport::AuthenticatedTls
         || middleware.target.scheme != "https"
@@ -242,14 +214,35 @@ where
         || options.mcp_request_validation.is_some()
         || request_has_upgrade_header(&req.raw_header)
     {
-        return Err(miette!("unsupported protected credential operation"));
+        return Err(miette!("unsupported external HTTP exchange"));
+    }
+    // This bounded seam accepts fixed-length or empty requests only. Reject
+    // Expect before the shared buffer can emit an interim 100 response.
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .ok_or_else(|| miette!("exchange request framing invalid"))?;
+    let head = std::str::from_utf8(&req.raw_header[..header_end])
+        .map_err(|_| miette!("exchange request headers invalid"))?;
+    if head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.eq_ignore_ascii_case("expect"))
+        || matches!(req.body_length, super::BodyLength::Chunked)
+        || matches!(req.body_length, super::BodyLength::ContentLength(n)
+            if (req.raw_header.len() - header_end) as u64 > n)
+    {
+        return Err(miette!("unsupported exchange request framing"));
     }
     let guard = options
         .generation_guard
-        .ok_or_else(|| miette!("credential policy guard is missing"))?;
+        .ok_or_else(|| miette!("exchange policy guard is missing"))?;
     let connection = middleware
-        .credential_connection
-        .ok_or_else(|| miette!("verified credential connection is missing"))?;
+        .exchange_connection
+        .ok_or_else(|| miette!("verified exchange connection is missing"))?;
     let proof = connection.proof_for(
         &middleware.target.host,
         u16::try_from(middleware.target.port).map_err(|_| miette!("invalid port"))?,
@@ -258,9 +251,9 @@ where
     let request_context = middleware.request_context.clone();
     let authority = middleware
         .runner
-        .credential_authority(middleware.chain)
+        .http_exchange_authority(middleware.chain)
         .await?
-        .ok_or_else(|| miette!("credential authority is missing"))?;
+        .ok_or_else(|| miette!("HTTP exchange authority is missing"))?;
     let _admission = middleware
         .runner
         .reserve_middleware_work_admission()
@@ -291,28 +284,8 @@ where
             return Err(miette!("protected request exceeds capacity"));
         }
     };
-    let mut headers = strip_connection_nominated_headers(&buffered.headers, false)?;
+    let headers = strip_connection_nominated_headers(&buffered.headers, false)?;
     let raw_query = crate::l7::middleware::raw_query_from_request_headers(&headers)?;
-    // Execution/control authentication is never provider authentication. Drop
-    // every supported credential field, not merely the one selected for injection.
-    // To keep operator-specific control headers out of both the authority input
-    // and the provider request, this prototype strips all workload-supplied X- headers.
-    let names: Vec<String> = std::str::from_utf8(&headers)
-        .map_err(|_| miette!("invalid protected headers"))?
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, _)| name.to_ascii_lowercase())
-        .filter(|name| {
-            is_credential_header(name)
-                || matches!(name.as_str(), "cookie" | "set-cookie" | "forwarded")
-                || name.starts_with("proxy-")
-                || name.starts_with("x-")
-        })
-        .collect();
-    for name in names {
-        headers = strip_header(&headers, &name)?;
-    }
     if contains_reserved_credential_marker_bytes(&buffered.body)
         || contains_reserved_credential_marker_bytes(&headers)
     {
@@ -320,14 +293,25 @@ where
             "protected operation contains unresolved credential markers"
         ));
     }
-    let visible = crate::l7::middleware::safe_middleware_headers(&headers)?.visible;
+    // Deliberately narrow allowlist: workload authentication, routing, custom
+    // control and framing headers never cross this seam. Content-Length is not
+    // authority input; the service frames the provided body itself.
+    let visible: Vec<_> = crate::l7::middleware::safe_middleware_headers(&headers)?
+        .visible
+        .into_iter()
+        .filter(|(name, _)| matches!(name.as_str(), "accept" | "content-type"))
+        .collect();
     let mut target = middleware.target.clone();
     target.query = raw_query;
     guard.ensure_current()?;
     let mut extra = [0; 1];
     let dispatch = async {
-        let selection = match authority
-            .resolve(
+        guard.ensure_current()?;
+        *opening_started_remote = true;
+        progress.opening_started = true;
+        progress.event("exchange_started");
+        let approved = authority
+            .exchange(
                 HttpRequestEvaluation {
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     context: Some(request_context),
@@ -337,105 +321,33 @@ where
                         .into_iter()
                         .map(|(name, value)| HttpHeader { name, value })
                         .collect(),
-                    body: buffered.body.clone(),
+                    body: buffered.body,
                     middleware_name: String::new(),
                 },
                 deadline,
                 &custody,
                 proof,
             )
-            .await
-        {
-            Ok(selection) => {
-                progress.event(if selection.no_material_required() {
-                    "resolve_no_material_accepted"
-                } else {
-                    "resolve_accepted"
-                });
-                selection
-            }
-            Err(err) => {
-                progress.event("resolve_refused");
-                return Err(err);
-            }
-        };
-
-        // Complete every transform before the final online authorization. The final
-        // permit cannot authorize a different body, destination, header or material.
-        let rebuilt = rebuild_request_with_buffered_body(req, &headers, &buffered.body, &[])?;
-        let header_end = rebuilt
-            .raw_header
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| miette!("protected request framing invalid"))?
-            + 4;
-        let mut outgoing = Zeroizing::new(rebuilt.raw_header[..header_end - 2].to_vec());
-        let mut secret_needles = Vec::new();
-        for header in selection.headers() {
-            if !is_credential_header(&header.name) {
-                return Err(miette!("invalid credential header"));
-            }
-            outgoing.extend_from_slice(header.name.as_bytes());
-            outgoing.extend_from_slice(b": ");
-            outgoing.extend_from_slice(header.value.as_bytes());
-            outgoing.extend_from_slice(b"\r\n");
-            secret_needles.push(Zeroizing::new(header.value.as_bytes().to_vec()));
-            if header.name == "authorization"
-                && let Some((_, token)) = header.value.split_once(' ')
-                && !token.is_empty()
-            {
-                secret_needles.push(Zeroizing::new(token.as_bytes().to_vec()));
-            }
-        }
-        outgoing.extend_from_slice(b"\r\n");
-        outgoing.extend_from_slice(&buffered.body);
-        guard.ensure_current()?;
-        let no_material = selection.no_material_required();
-        let permit = selection.authorize_send(&custody).await?;
-        progress.event(if no_material {
-            "permit_no_material_accepted"
-        } else {
-            "permit_accepted"
-        });
-        progress.permit_accepted = true;
-        let mut status_line = String::new();
-        let start_by = permit.send_start_by();
-        let approved = permit
-            .dispatch_and_protect(&custody, async {
-                guard.ensure_current()?;
-                let start_window = start_by
-                    .duration_since(SystemTime::now())
-                    .map_err(|_| miette!("send start expired"))?;
-                *dispatch_started = true;
-                let first = tokio::time::timeout(start_window, upstream.write(&outgoing))
-                    .await
-                    .map_err(|_| miette!("send start expired"))?
-                    .into_diagnostic()?;
-                if first == 0 {
-                    return Err(miette!("protected send made no progress"));
-                }
-                upstream
-                    .write_all(&outgoing[first..])
-                    .await
-                    .into_diagnostic()?;
-                upstream.flush().await.into_diagnostic()?;
-                let (status, captured) =
-                    capture_custody_response(upstream, &req.action, response_limit, observer)
-                        .await?;
-                status_line = status;
-                Ok(captured)
-            })
             .await?;
-        let mut response = ProtectedResponse::default();
-        frame_custody_response(&status_line, approved, &mut response).await?;
-        if secret_needles.iter().any(|secret| {
-            response
-                .bytes
-                .windows(secret.len())
-                .any(|w| w == secret.as_slice())
-        }) {
-            return Err(miette!("protected response contains selected material"));
+        if approved.body.len() > response_limit {
+            return Err(miette!("exchange response exceeds capacity"));
         }
+        // Fixed local framing; the service cannot inject headers or choose a
+        // downstream destination. HEAD is represented with an empty body.
+        if req.action == "HEAD" && !approved.body.is_empty() {
+            return Err(miette!("exchange HEAD body invalid"));
+        }
+        let length = if matches!(approved.status, 204 | 304) {
+            String::new()
+        } else {
+            format!("Content-Length: {}\r\n", approved.body.len())
+        };
+        let mut response = format!(
+            "HTTP/1.1 {} Response\r\nContent-Type: {}\r\n{length}Connection: close\r\n\r\n",
+            approved.status, approved.content_type,
+        )
+        .into_bytes();
+        response.extend_from_slice(&approved.body);
         Ok(response)
     };
     let response = tokio::select! {
@@ -443,6 +355,7 @@ where
         // After the request is complete, EOF, error or a pipelined request all revoke this
         // pending sender. Dropping the exchange cancels it; there is no replacement destination.
         _ = client.read(&mut extra) => return Err(miette!("accepted response stream closed or changed")),
+        _ = guard.wait_until_stale() => return Err(miette!("exchange generation changed")),
         result = dispatch => result?,
     };
 
@@ -452,43 +365,22 @@ where
     }
     guard.ensure_current()?;
     progress.delivery_started = true;
-    client.write_all(&response.bytes).await.into_diagnostic()?;
-    client.flush().await.into_diagnostic()?;
-    client.shutdown().await.into_diagnostic()?;
+    tokio::select! {
+        biased;
+        _ = guard.wait_until_stale() => return Err(miette!("exchange generation changed during delivery")),
+        result = async {
+            client.write_all(&response).await?;
+            client.flush().await?;
+            client.shutdown().await
+        } => result.into_diagnostic()?,
+    }
     progress.event("response_released");
     progress.released = true;
     // One protected operation per connection; another operation must capture
-    // again. No redirect handling, retry or upgrade can reuse this permit.
+    // again. No redirect handling, retry or upgrade can reuse this exchange.
     Ok(RelayOutcome::Consumed)
 }
 
 #[cfg(test)]
-#[path = "static_credentials_tests.rs"]
+#[path = "external_exchange_tests.rs"]
 mod tests;
-
-#[derive(Default)]
-struct ProtectedResponse {
-    bytes: Zeroizing<Vec<u8>>,
-}
-
-impl AsyncWrite for ProtectedResponse {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if bytes.len() > MAX_PROTECTED_RESPONSE_BYTES.saturating_sub(self.bytes.len()) {
-            return Poll::Ready(Err(std::io::Error::other(
-                "protected response exceeds capacity",
-            )));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Poll::Ready(Ok(bytes.len()))
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}

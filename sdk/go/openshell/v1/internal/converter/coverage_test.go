@@ -179,13 +179,13 @@ func TestConverterCoversAllProtoFields_SandboxPolicy(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_NetworkMiddlewareConfig(t *testing.T) {
 	handled := fieldSet{
-		"name":                 true,
-		"middleware":           true,
-		"config":               true,
-		"on_error":             true,
-		"endpoints":            true,
-		"order":                true,
-		"credential_authority": true,
+		"name":                   true,
+		"middleware":             true,
+		"config":                 true,
+		"on_error":               true,
+		"endpoints":              true,
+		"order":                  true,
+		"external_http_exchange": true,
 	}
 
 	assertAllFieldsCovered(t, (&sandboxpb.NetworkMiddlewareConfig{}).ProtoReflect().Descriptor(), handled, nil)

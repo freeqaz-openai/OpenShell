@@ -464,27 +464,16 @@ pub struct L7DenyRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CredentialConnector {
-    pub path: String,
-    pub sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NetworkBinary {
     pub path: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkMiddleware {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credential_connectors: Vec<CredentialConnector>,
-    /// Select an exclusive authenticated STATIC credential authority.
+    /// Delegate admitted HTTPS REST requests from all qualifying workload processes
+    /// in this sandbox to the named installation-admin authority, without direct fallback.
     #[serde(default, skip_serializing_if = "is_default")]
-    pub credential_authority: bool,
-    /// An explicit whole-execution grant, never inferred from absent executable pins.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub execution_authority: bool,
+    pub external_http_exchange: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub middleware: String,
@@ -760,9 +749,7 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
                 "order",
                 "config",
                 "on_error",
-                "credential_authority",
-                "execution_authority",
-                "credential_connectors",
+                "external_http_exchange",
                 "endpoints",
             ],
         )? {
@@ -1160,6 +1147,27 @@ pub fn normalize_path(path: &str) -> String {
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn external_http_exchange_is_explicit_and_old_grants_are_rejected() {
+        let policy = |field: &str| {
+            format!(
+                "version: 1\nnetwork_middlewares:\n  authority:\n    middleware: test/authority\n    {field}\n    endpoints: {{include: [api.example.com]}}\n"
+            )
+        };
+        let ordinary = parse_policy(&policy("order: 1")).unwrap();
+        assert!(!ordinary.network_middlewares["authority"].external_http_exchange);
+        let exchange = parse_policy(&policy("external_http_exchange: true")).unwrap();
+        assert!(exchange.network_middlewares["authority"].external_http_exchange);
+        for field in [
+            "external_http_exchange: yes",
+            "credential_authority: true",
+            "execution_authority: true",
+            "credential_connectors: []",
+        ] {
+            assert!(parse_policy(&policy(field)).is_err(), "{field}");
+        }
+    }
 
     #[test]
     fn requires_version_one() {

@@ -7,8 +7,8 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
-mod credentials;
-pub(super) use credentials::AcceptedResponseSink;
+mod external_exchange;
+pub(super) use external_exchange::AcceptedResponseSink;
 mod http_response;
 
 pub(crate) use http_response::{
@@ -58,8 +58,7 @@ async fn max_middleware_body_bytes() -> usize {
             .expect("built-in middleware service"),
     )
     .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
-        credential_authority: false,
-        execution_authority: false,
+        external_http_exchange: false,
         name: "test".into(),
         implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
         order: 0,
@@ -889,7 +888,7 @@ where
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
     if let Some(middleware) = response_middleware.as_ref()
-        && openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain)
+        && openshell_supervisor_middleware::external_exchange::has_external_http_exchange(middleware.chain)
     {
         // Protected traffic must come from the REST owner that captured the actual response
         // sink at acceptance. Never reconstruct its custody here or enter a legacy resolver.
@@ -6638,8 +6637,7 @@ mod tests {
                 captured_preflight_headers: Some(Arc::clone(&captured)),
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,
@@ -6782,8 +6780,7 @@ mod tests {
                 captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,
@@ -6799,7 +6796,7 @@ mod tests {
         method: &str,
     ) -> HttpResponseMiddlewareRelay<'a> {
         HttpResponseMiddlewareRelay {
-            credential_connection: None,
+            exchange_connection: None,
             upstream_transport: crate::l7::tls::UpstreamTransport::Plaintext,
             chain,
             runner,
@@ -7052,8 +7049,7 @@ mod tests {
                 captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
-            credential_authority: false,
-            execution_authority: false,
+            external_http_exchange: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,

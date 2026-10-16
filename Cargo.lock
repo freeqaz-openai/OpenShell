@@ -4780,11 +4780,9 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "prost",
  "prost-types",
- "sha2 0.10.9",
  "tokio",
  "tokio-stream",
  "tonic",
- "zeroize",
 ]
 
 [[package]]
@@ -4861,7 +4859,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
- "zeroize",
 ]
 
 [[package]]
