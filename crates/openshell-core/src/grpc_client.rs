@@ -1062,7 +1062,7 @@ pub async fn sync_policy_and_fetch_snapshot_with_capabilities(
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
-    capabilities: &[String],
+    capabilities: &[&str],
 ) -> Result<SettingsPollResult> {
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;

@@ -2016,7 +2016,7 @@ impl StartupGateway for RemoteStartupGateway {
             sandbox,
             policy,
             workspace,
-            &enforced_runtime_capabilities(),
+            SUPPORTED_ENFORCEMENT_CAPABILITIES,
         )
         .await
     }
