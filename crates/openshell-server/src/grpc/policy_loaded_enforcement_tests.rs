@@ -25,6 +25,7 @@ const SERVICE: &str = "receipt/authority";
 #[derive(Clone)]
 struct ManifestService {
     upgraded: Arc<AtomicBool>,
+    exchange_binding: Arc<AtomicBool>,
     signed_identity: Arc<std::sync::Mutex<Option<jsonwebtoken::DecodingKey>>>,
 }
 
@@ -85,7 +86,12 @@ impl supervisor_middleware_server::SupervisorMiddleware for ManifestService {
             vec![]
         };
         let bindings = vec![MiddlewareBinding {
-            operation: SupervisorMiddlewareOperation::HttpExchange.into(),
+            operation: if self.exchange_binding.load(Ordering::SeqCst) {
+                SupervisorMiddlewareOperation::HttpExchange
+            } else {
+                SupervisorMiddlewareOperation::HttpRequest
+            }
+            .into(),
             phase: SupervisorMiddlewarePhase::PreCredentials.into(),
             max_payload_bytes: 4 * 1024 * 1024,
             ..Default::default()
@@ -153,6 +159,7 @@ impl ManifestFixture {
         let port = listener.local_addr().unwrap().port();
         let service = ManifestService {
             upgraded: Arc::new(AtomicBool::new(false)),
+            exchange_binding: Arc::new(AtomicBool::new(true)),
             signed_identity: Arc::new(std::sync::Mutex::new(None)),
         };
         let server_service = service.clone();
@@ -228,8 +235,17 @@ async fn gateway_admits_protected_policy_without_claiming_installation_possessio
     .unwrap()
     .unwrap();
     assert!(gateway.slot.installation_key().is_none());
-    let old_registry = fixture.registry_with_credential(gateway.slot.clone()).await;
+    let missing_capability_registry = fixture.registry_with_credential(gateway.slot.clone()).await;
     fixture.service.upgraded.store(true, Ordering::SeqCst);
+    fixture
+        .service
+        .exchange_binding
+        .store(false, Ordering::SeqCst);
+    let missing_binding_registry = fixture.registry_with_credential(gateway.slot.clone()).await;
+    fixture
+        .service
+        .exchange_binding
+        .store(true, Ordering::SeqCst);
     let registry = fixture.registry_with_credential(gateway.slot.clone()).await;
 
     let policy = exchange_policy();
@@ -253,9 +269,24 @@ async fn gateway_admits_protected_policy_without_claiming_installation_possessio
         "{error}"
     );
 
-    let error = admission(&old_registry, &policy).await.unwrap_err();
+    let error = admission(&missing_binding_registry, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(
-        error.message().contains("capability is unavailable"),
+        error
+            .message()
+            .contains("HTTP exchange authority capability is unavailable"),
+        "{error}"
+    );
+    let error = admission(&missing_capability_registry, &policy)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("HTTP exchange authority requires terminal exchange capability"),
         "{error}"
     );
 }
@@ -391,24 +422,35 @@ async fn installed_exchange_evidence_is_exact_current_and_gateway_keyed() {
     )
     .await
     .unwrap();
-    let withheld = handle_get_sandbox_config(
-        &state,
-        with_sandbox(
-            Request::new(GetSandboxConfigRequest {
-                name: NAME.into(),
-                ..Default::default()
-            }),
-            SANDBOX,
-        ),
-    )
-    .await
-    .unwrap()
-    .into_inner();
-    assert!(!withheld.configuration_admitted);
-    assert!(withheld.policy.is_none());
-    assert!(withheld.supervisor_middleware_services.is_empty());
+    let old_supervisor = GetSandboxConfigRequest {
+        name: NAME.into(),
+        ..Default::default()
+    };
+    let unknown_supervisor = GetSandboxConfigRequest {
+        supported_enforcement_capabilities: vec!["unknown".into()],
+        ..old_supervisor.clone()
+    };
+    for (supervisor, request) in [("old", old_supervisor), ("unknown", unknown_supervisor)] {
+        let withheld =
+            handle_get_sandbox_config(&state, with_sandbox(Request::new(request), SANDBOX))
+                .await
+                .unwrap()
+                .into_inner();
+        assert!(!withheld.configuration_admitted, "{supervisor}");
+        assert!(withheld.policy.is_none(), "{supervisor}");
+        assert!(
+            withheld.supervisor_middleware_services.is_empty(),
+            "{supervisor}"
+        );
+    }
     let current = config(&state).await;
     assert!(current.configuration_admitted);
+    assert!(
+        current
+            .supervisor_middleware_services
+            .iter()
+            .any(|registration| registration.name == SERVICE)
+    );
     let mut accepted = acceptance(instance, &current);
     policy_status(&state, current.version, PolicyStatus::Loaded).await;
     assert_no_evidence(&state).await;

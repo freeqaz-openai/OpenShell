@@ -1638,7 +1638,7 @@ where
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         })
         .await;
     let config = match config_result {
@@ -4868,7 +4868,7 @@ pub async fn sandbox_settings_get(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -5325,7 +5325,7 @@ pub async fn sandbox_policy_update(
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -5617,7 +5617,7 @@ where
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         })
         .await
         .into_diagnostic()?

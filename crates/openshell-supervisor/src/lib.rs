@@ -1979,13 +1979,8 @@ trait StartupGateway: Send + Sync {
     ) -> Result<()>;
 }
 
-fn enforced_runtime_capabilities() -> Vec<String> {
-    openshell_core::extension_protocol::external_http_exchange_capabilities()
-        .iter()
-        .copied()
-        .map(str::to_string)
-        .collect()
-}
+const SUPPORTED_ENFORCEMENT_CAPABILITIES: &[&str] =
+    &[openshell_core::extension_protocol::EXTERNAL_HTTP_EXCHANGE_CAPABILITY];
 
 struct RemoteStartupGateway {
     endpoint: String,
@@ -2000,7 +1995,7 @@ impl StartupGateway for RemoteStartupGateway {
         openshell_core::grpc_client::fetch_settings_snapshot_with_capabilities(
             &self.endpoint,
             sandbox,
-            &enforced_runtime_capabilities(),
+            SUPPORTED_ENFORCEMENT_CAPABILITIES,
         )
         .await
     }
@@ -3950,7 +3945,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     run_policy_poll_loop_with_client(
         ctx,
         client
-            .with_enforcement_capabilities(enforced_runtime_capabilities())
+            .with_enforcement_capabilities(SUPPORTED_ENFORCEMENT_CAPABILITIES)
             .with_configuration_instance(instance_id),
     )
     .await

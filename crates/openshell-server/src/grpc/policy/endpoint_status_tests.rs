@@ -524,7 +524,7 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
             Request::new(GetSandboxConfigRequest {
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             sandbox_id,
         ),
@@ -868,7 +868,7 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
             Request::new(GetSandboxConfigRequest {
                 name: sandbox_id.to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             sandbox_id,
         ),

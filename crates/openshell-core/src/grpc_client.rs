@@ -918,7 +918,7 @@ pub async fn fetch_settings_snapshot(
 pub async fn fetch_settings_snapshot_with_capabilities(
     endpoint: &str,
     sandbox_name: &str,
-    capabilities: &[String],
+    capabilities: &[&str],
 ) -> Result<SettingsPollResult> {
     let mut client = connect(endpoint).await?;
     fetch_settings_snapshot_with_client(&mut client, sandbox_name, None, capabilities).await
@@ -928,14 +928,14 @@ async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
     workspace: Option<&str>,
-    supported_enforcement_capabilities: &[String],
+    supported_enforcement_capabilities: &[&str],
 ) -> Result<SettingsPollResult> {
     let response = client
-        .get_sandbox_config(GetSandboxConfigRequest {
-            workspace_scope: workspace.map(crate::proto::workspace_selector),
-            name: sandbox_name.to_string(),
-            supported_enforcement_capabilities: supported_enforcement_capabilities.to_vec(),
-        })
+        .get_sandbox_config(settings_request(
+            sandbox_name,
+            workspace,
+            supported_enforcement_capabilities,
+        ))
         .await
         .map_err(grpc_status_error)?;
 
@@ -944,6 +944,21 @@ async fn fetch_settings_snapshot_with_client(
 
 fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
     workspace.map(crate::proto::workspace_selector)
+}
+
+fn settings_request(
+    sandbox_name: &str,
+    workspace: Option<&str>,
+    supported_enforcement_capabilities: &[&str],
+) -> GetSandboxConfigRequest {
+    GetSandboxConfigRequest {
+        name: sandbox_name.to_string(),
+        workspace_scope: learned_workspace_selector(workspace),
+        supported_enforcement_capabilities: supported_enforcement_capabilities
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect(),
+    }
 }
 
 /// Fetch sandbox policy using an existing client connection.
@@ -1297,7 +1312,7 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 /// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
-    supported_enforcement_capabilities: Vec<String>,
+    supported_enforcement_capabilities: &'static [&'static str],
     configuration_instance_id: String,
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
@@ -1471,7 +1486,7 @@ impl CachedOpenShellClient {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
         Ok(Self {
-            supported_enforcement_capabilities: Vec::new(),
+            supported_enforcement_capabilities: &[],
             configuration_instance_id: String::new(),
             client,
             workspace: Arc::new(tokio::sync::OnceCell::new()),
@@ -1481,7 +1496,7 @@ impl CachedOpenShellClient {
 
     /// Explicitly declare capabilities implemented by this supervisor build.
     #[must_use]
-    pub fn with_enforcement_capabilities(mut self, capabilities: Vec<String>) -> Self {
+    pub fn with_enforcement_capabilities(mut self, capabilities: &'static [&'static str]) -> Self {
         self.supported_enforcement_capabilities = capabilities;
         self
     }
@@ -1496,15 +1511,14 @@ impl CachedOpenShellClient {
         // Sandbox-authenticated callers may omit the selector during bootstrap.
         // Once the first response identifies the workspace, scope every later
         // poll explicitly instead of constructing an invalid empty selector.
-        let workspace_scope = learned_workspace_selector(self.workspace.get().map(String::as_str));
         let response = self
             .client
             .clone()
-            .get_sandbox_config(GetSandboxConfigRequest {
-                workspace_scope,
-                name: sandbox_name.to_string(),
-                supported_enforcement_capabilities: self.supported_enforcement_capabilities.clone(),
-            })
+            .get_sandbox_config(settings_request(
+                sandbox_name,
+                self.workspace.get().map(String::as_str),
+                self.supported_enforcement_capabilities,
+            ))
             .await
             .into_diagnostic()?;
 

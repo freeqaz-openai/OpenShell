@@ -8001,7 +8001,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8190,7 +8190,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8223,7 +8223,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8475,7 +8475,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
-                        supported_enforcement_capabilities: Vec::new(),
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -8524,7 +8524,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8580,7 +8580,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
-                        supported_enforcement_capabilities: Vec::new(),
+                        ..Default::default()
                     }),
                     &sandbox_id,
                 ),
@@ -8728,7 +8728,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8840,7 +8840,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -8898,7 +8898,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
-                    supported_enforcement_capabilities: Vec::new(),
+                    ..Default::default()
                 }),
                 sandbox_id,
             ),
@@ -10748,7 +10748,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "sb-b".to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -10765,7 +10765,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "missing-sandbox".to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-a",
         );
@@ -10804,7 +10804,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -10820,7 +10820,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-self",
         );
@@ -11003,7 +11003,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         }));
         handle_get_sandbox_config(&state, req)
             .await
@@ -11233,7 +11233,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -11351,7 +11351,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -11377,7 +11377,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -11983,7 +11983,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -12699,7 +12699,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -13345,7 +13345,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -13411,7 +13411,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -13472,7 +13472,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -14595,7 +14595,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             })),
         )
         .await
@@ -21265,7 +21265,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-alpha",
         );
@@ -21279,7 +21279,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
             "sb-beta",
         );
@@ -23020,7 +23020,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),
                 )),
-                supported_enforcement_capabilities: Vec::new(),
+                ..Default::default()
             }),
         )
         .await

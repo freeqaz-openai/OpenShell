@@ -78,7 +78,7 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name.to_string(),
             workspace_scope: None,
-            supported_enforcement_capabilities: Vec::new(),
+            ..Default::default()
         })
         .await;
     match resp {
