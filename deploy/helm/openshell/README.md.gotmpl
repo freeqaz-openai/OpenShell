@@ -17,6 +17,10 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+For remote supervisor services, see [Configure remote supervisor middleware](middleware.md)
+for the registry values, public-root mounting, startup dependencies and local
+render verification.
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.

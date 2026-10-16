@@ -17,6 +17,10 @@ namespace. The gateway and workspace releases can then be upgraded and removed
 independently. Use Kubernetes `operator` workspace mode when one gateway serves
 multiple pre-provisioned workspace namespaces.
 
+For remote supervisor services, see [Configure remote supervisor middleware](middleware.md)
+for the registry values, public-root mounting, startup dependencies and local
+render verification.
+
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
@@ -476,6 +480,7 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.middleware | list | `[]` | Operator-owned HTTPS middleware registrations. Each entry has name, grpcEndpoint, audience, maxPayloadBytes and optional timeout (10ms–30s). A private root CA uses tlsCaConfigMapName and tlsCaKey (default ca.crt). The Gateway reads the public CA and distributes it to supervisors. See middleware.md for startup ordering, trust ownership and verification. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

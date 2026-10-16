@@ -384,6 +384,10 @@ The gateway flushes buffered spans during shutdown, so spans from in-flight requ
 
 Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
 
+For Helm deployments, `supervisor.middleware` renders these registrations. Each entry requires `name`, `grpcEndpoint` (HTTPS), `audience`, and `maxPayloadBytes`; `timeout` is optional. To trust a private CA, set `tlsCaConfigMapName` and optional `tlsCaKey` (default `ca.crt`) to a ConfigMap in the release namespace. The chart mounts that public certificate read-only and renders `tls_ca_cert_path`. Keep private keys out of this ConfigMap. Both StatefulSet and Deployment workloads use the same registration and trust mounts.
+
+The Gateway negotiates with registered services during startup. Install their dependencies before waiting for Gateway readiness; do not replace failed negotiation with an empty capability response.
+
 ```toml
 [[openshell.supervisor.middleware]]
 name = "local-content-guard"

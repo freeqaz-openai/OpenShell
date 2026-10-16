@@ -56,6 +56,12 @@ sandboxRuntime:
 
 # Trusted control-side runtime image.
 supervisor:
+  # -- Operator-owned HTTPS middleware registrations. Each entry has name,
+  # grpcEndpoint, audience, maxPayloadBytes and optional timeout (10ms–30s).
+  # A private root CA uses tlsCaConfigMapName and tlsCaKey (default ca.crt).
+  # The Gateway reads the public CA and distributes it to supervisors.
+  # See middleware.md for startup ordering, trust ownership and verification.
+  middleware: []
   image:
     # -- Supervisor image registry. Empty uses global.image.registry.
     registry: ""

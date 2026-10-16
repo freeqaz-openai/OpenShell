@@ -184,6 +184,13 @@ spec:
           mountPath: {{ dir .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
           readOnly: true
         {{- end }}
+        {{- range $index, $middleware := .Values.supervisor.middleware }}
+        {{- if $middleware.tlsCaConfigMapName }}
+        - name: middleware-ca-{{ $index }}
+          mountPath: /etc/openshell-middleware-ca/{{ $index }}
+          readOnly: true
+        {{- end }}
+        {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -293,6 +300,16 @@ spec:
       csi:
         driver: csi.spiffe.io
         readOnly: true
+    {{- end }}
+    {{- range $index, $middleware := .Values.supervisor.middleware }}
+    {{- if $middleware.tlsCaConfigMapName }}
+    - name: middleware-ca-{{ $index }}
+      configMap:
+        name: {{ $middleware.tlsCaConfigMapName | quote }}
+        items:
+          - key: {{ $middleware.tlsCaKey | default "ca.crt" | quote }}
+            path: ca.crt
+    {{- end }}
     {{- end }}
     {{- with .Values.server.extraVolumes }}
     {{- toYaml . | nindent 4 }}

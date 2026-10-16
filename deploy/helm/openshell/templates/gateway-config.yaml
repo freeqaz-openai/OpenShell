@@ -309,3 +309,52 @@ data:
     timeout_secs = {{ .Values.server.credentialDrivers.vault.timeoutSecs }}
     {{- end }}
     {{- end }}
+
+    {{- $middlewareNames := dict }}
+    {{- range $index, $middleware := .Values.supervisor.middleware }}
+    {{- range $key, $_ := $middleware }}
+    {{- if not (has $key (list "name" "grpcEndpoint" "audience" "maxPayloadBytes" "timeout" "tlsCaConfigMapName" "tlsCaKey")) }}
+    {{- fail (printf "unsupported supervisor.middleware field %s" $key) }}
+    {{- end }}
+    {{- end }}
+    {{- $name := required "supervisor.middleware[].name is required" $middleware.name }}
+    {{- if or (not (regexMatch "^[a-zA-Z0-9][a-zA-Z0-9._-]*$" $name)) (hasKey $middlewareNames $name) }}
+    {{- fail "supervisor.middleware names must be unique identifiers" }}
+    {{- end }}
+    {{- $_ := set $middlewareNames $name true }}
+    {{- $endpoint := required "supervisor.middleware[].grpcEndpoint is required" $middleware.grpcEndpoint }}
+    {{- if not (regexMatch "^https://[^/?#@[:space:]]+(:[0-9]+)?$" $endpoint) }}
+    {{- fail "supervisor.middleware[].grpcEndpoint must be an HTTPS origin without userinfo" }}
+    {{- end }}
+    {{- $audience := required "supervisor.middleware[].audience is required" $middleware.audience }}
+    {{- $limit := required "supervisor.middleware[].maxPayloadBytes is required" $middleware.maxPayloadBytes }}
+    {{- if or (le (float64 $limit) 0.0) (ne (float64 $limit) (float64 (int64 $limit))) (gt (float64 $limit) 9007199254740991.0) }}
+    {{- fail "supervisor.middleware[].maxPayloadBytes must be a positive safe integer" }}
+    {{- end }}
+    [[openshell.supervisor.middleware]]
+    name = {{ $name | toJson }}
+    grpc_endpoint = {{ $endpoint | toJson }}
+    audience = {{ $audience | toJson }}
+    max_payload_bytes = {{ int64 $limit }}
+    allow_insecure_transport = false
+    {{- if $middleware.tlsCaConfigMapName }}
+    tls_ca_cert_path = {{ printf "/etc/openshell-middleware-ca/%d/ca.crt" $index | quote }}
+    {{- else if $middleware.tlsCaKey }}
+    {{- fail "supervisor.middleware[].tlsCaKey requires tlsCaConfigMapName" }}
+    {{- end }}
+    {{- if $middleware.timeout }}
+    {{- if not (regexMatch "^[1-9][0-9]*(ms|s)$" $middleware.timeout) }}
+    {{- fail "supervisor.middleware[].timeout must be 10ms to 30s" }}
+    {{- end }}
+    {{- $milliseconds := int (trimSuffix "ms" (trimSuffix "s" $middleware.timeout)) }}
+    {{- if hasSuffix "ms" $middleware.timeout }}
+    {{- $milliseconds = int (trimSuffix "ms" $middleware.timeout) }}
+    {{- else }}
+    {{- $milliseconds = mul (int (trimSuffix "s" $middleware.timeout)) 1000 }}
+    {{- end }}
+    {{- if or (lt (int $milliseconds) 10) (gt (int $milliseconds) 30000) }}
+    {{- fail "supervisor.middleware[].timeout must be 10ms to 30s" }}
+    {{- end }}
+    timeout = {{ $middleware.timeout | toJson }}
+    {{- end }}
+    {{- end }}
