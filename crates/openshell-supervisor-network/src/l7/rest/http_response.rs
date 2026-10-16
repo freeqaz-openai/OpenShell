@@ -54,7 +54,9 @@ where
 {
     let started_at = std::time::Instant::now();
     if response_middleware.as_ref().is_some_and(|middleware| {
-        openshell_supervisor_middleware::external_exchange::has_external_http_exchange(middleware.chain)
+        openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
+            middleware.chain,
+        )
     }) {
         return Err(miette!(
             "external exchange cannot read a direct origin response"

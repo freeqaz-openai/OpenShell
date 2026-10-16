@@ -14,7 +14,7 @@ use openshell_supervisor_middleware::external_exchange::MAX_HTTP_EXCHANGE_OPERAT
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{
-    BufferResult, HttpResponseMiddlewareRelay, L7Request, RelayOutcome, RelayRequestOptions,
+    BufferResult, HttpResponseMiddlewareRelay, L7Request, RelayOutcome,
     buffer_request_body_for_middleware, request_authority, request_has_upgrade_header,
     strip_connection_nominated_headers,
 };
@@ -46,25 +46,33 @@ impl<'a, C: AsyncRead + AsyncWrite + Unpin> AcceptedResponseSink<'a, C> {
         self.downstream
     }
 
+    pub(crate) fn into_client(self) -> &'a mut C {
+        self.downstream
+    }
+
     pub(crate) async fn relay(
         self,
         req: &L7Request,
-        options: RelayRequestOptions<'_>,
+        config: &crate::l7::L7EndpointConfig,
         middleware: HttpResponseMiddlewareRelay<'_>,
     ) -> Result<RelayOutcome> {
-        let custody = self
-            .custody
-            .ok_or_else(|| miette!("protected operation lacks an accepted response stream"))?;
         // Keep complete protected-response custody off the ordinary per-connection future stack.
-        Box::pin(relay(req, self.downstream, custody, options, middleware)).await
+        Box::pin(relay(
+            req,
+            self.downstream,
+            self.custody,
+            config,
+            middleware,
+        ))
+        .await
     }
 }
 
 async fn relay<C>(
     req: &L7Request,
     client: &mut C,
-    custody: [u8; 32],
-    options: RelayRequestOptions<'_>,
+    custody: Option<[u8; 32]>,
+    config: &crate::l7::L7EndpointConfig,
     middleware: HttpResponseMiddlewareRelay<'_>,
 ) -> Result<RelayOutcome>
 where
@@ -96,7 +104,7 @@ where
         exchange(
             req,
             client,
-            options,
+            config,
             middleware,
             deadline,
             custody,
@@ -197,21 +205,24 @@ impl Drop for CustodyProgress<'_> {
 async fn exchange<C>(
     req: &L7Request,
     client: &mut C,
-    options: RelayRequestOptions<'_>,
+    config: &crate::l7::L7EndpointConfig,
     middleware: HttpResponseMiddlewareRelay<'_>,
     deadline: SystemTime,
-    custody: [u8; 32],
+    custody: Option<[u8; 32]>,
     progress: &mut CustodyProgress<'_>,
     opening_started_remote: &mut bool,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
+    let custody =
+        custody.ok_or_else(|| miette!("protected operation lacks an accepted response stream"))?;
     if middleware.upstream_transport != crate::l7::tls::UpstreamTransport::AuthenticatedTls
         || middleware.target.scheme != "https"
-        || options.credential_signing.is_sigv4()
-        || options.request_body_credential_rewrite
-        || options.mcp_request_validation.is_some()
+        || config.protocol != crate::l7::L7Protocol::Rest
+        || config.enforcement != crate::l7::EnforcementMode::Enforce
+        || config.credential_signing.is_sigv4()
+        || config.request_body_credential_rewrite
         || request_has_upgrade_header(&req.raw_header)
     {
         return Err(miette!("unsupported external HTTP exchange"));
@@ -237,7 +248,7 @@ where
     {
         return Err(miette!("unsupported exchange request framing"));
     }
-    let guard = options
+    let guard = middleware
         .generation_guard
         .ok_or_else(|| miette!("exchange policy guard is missing"))?;
     let connection = middleware
@@ -274,7 +285,7 @@ where
     let buffered = match buffer_request_body_for_middleware(
         req,
         client,
-        options.generation_guard,
+        Some(guard),
         authority.max_payload_bytes(),
     )
     .await?

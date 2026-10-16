@@ -888,7 +888,9 @@ where
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
     if let Some(middleware) = response_middleware.as_ref()
-        && openshell_supervisor_middleware::external_exchange::has_external_http_exchange(middleware.chain)
+        && openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
+            middleware.chain,
+        )
     {
         // Protected traffic must come from the REST owner that captured the actual response
         // sink at acceptance. Never reconstruct its custody here or enter a legacy resolver.

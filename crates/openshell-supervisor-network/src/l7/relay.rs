@@ -135,6 +135,52 @@ fn scoped_context_for_middleware_request(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpForwarding {
+    Direct,
+    Terminal,
+}
+
+impl HttpForwarding {
+    fn select(ctx: &L7EvalContext, chain: &[openshell_supervisor_middleware::ChainEntry]) -> Self {
+        if ctx.exchange_connection.is_some()
+            || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(chain)
+        {
+            Self::Terminal
+        } else {
+            Self::Direct
+        }
+    }
+
+    fn request_id(self) -> String {
+        match self {
+            Self::Direct => uuid::Uuid::new_v4(),
+            Self::Terminal => uuid::Uuid::now_v7(),
+        }
+        .to_string()
+    }
+
+    /// Only direct forwarding returns the accepted client and response middleware.
+    async fn forward<'a, 'm, C>(
+        self,
+        accepted: super::rest::AcceptedResponseSink<'a, C>,
+        req: &crate::l7::provider::L7Request,
+        config: &L7EndpointConfig,
+        middleware: crate::l7::rest::HttpResponseMiddlewareRelay<'m>,
+    ) -> Result<Option<(&'a mut C, crate::l7::rest::HttpResponseMiddlewareRelay<'m>)>>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        match self {
+            Self::Direct => Ok(Some((accepted.into_client(), middleware))),
+            Self::Terminal => {
+                accepted.relay(req, config, middleware).await?;
+                Ok(None)
+            }
+        }
+    }
+}
+
 fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
@@ -972,10 +1018,8 @@ where
 
         // Pin observation authority before parsing can await or a later
         // provider lookup can select state from another installation.
-        let mut accepted = super::rest::AcceptedResponseSink::capture(
-            client,
-            ctx.exchange_connection.is_some(),
-        )?;
+        let mut accepted =
+            super::rest::AcceptedResponseSink::capture(client, ctx.exchange_connection.is_some())?;
         let client = accepted.client();
         let observation_context = ctx
             .endpoint_observation_tx
@@ -1222,7 +1266,8 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::now_v7().to_string();
+            let forwarding = HttpForwarding::select(ctx, &response_chain);
+            let request_id = forwarding.request_id();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
@@ -1281,7 +1326,22 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_middleware_request(ctx, &req, &response_chain);
+            let middleware = http_response_middleware_relay(
+                &req,
+                ctx,
+                ctx.upstream_transport.scheme(),
+                &request_id,
+                &response_chain,
+                engine.middleware_runner(),
+                Some(engine.generation_guard()),
+            );
+            let Some((client, middleware)) = forwarding
+                .forward(accepted, &req, config, middleware)
+                .await?
+            else {
+                return Ok(());
+            };
+            let scoped_ctx = scoped_context_for_request(ctx, &req);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             // Credential scoping can acquire a newer revision after middleware.
             // Bind its actual snapshot to the original authority, never a fresh
@@ -1352,26 +1412,6 @@ where
                 host: &ctx.host,
                 port: ctx.port,
             };
-            let middleware = http_response_middleware_relay(
-                &req,
-                ctx,
-                ctx.upstream_transport.scheme(),
-                &request_id,
-                &response_chain,
-                engine.middleware_runner(),
-                Some(engine.generation_guard()),
-            );
-            if ctx.exchange_connection.is_some()
-                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
-                    &response_chain,
-                )
-            {
-                // L4 protection is terminal even if L7 selection is missing. The
-                // protected relay has no upstream socket and cannot fall back.
-                accepted.relay(&req, options, middleware).await?;
-                return Ok(());
-            }
-            let client = accepted.client();
             let outcome_result = relay_http_request_with_credential_rejection_observed(
                 &req,
                 client,
@@ -1890,10 +1930,8 @@ where
         }
 
         // Parse one HTTP request from client
-        let mut accepted = super::rest::AcceptedResponseSink::capture(
-            client,
-            ctx.exchange_connection.is_some(),
-        )?;
+        let mut accepted =
+            super::rest::AcceptedResponseSink::capture(client, ctx.exchange_connection.is_some())?;
         let client = accepted.client();
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
@@ -2023,7 +2061,8 @@ where
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::now_v7().to_string();
+            let forwarding = HttpForwarding::select(ctx, &response_chain);
+            let request_id = forwarding.request_id();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
@@ -2077,6 +2116,21 @@ where
                     return Ok(());
                 }
             };
+            let middleware = http_response_middleware_relay(
+                &req,
+                ctx,
+                ctx.upstream_transport.scheme(),
+                &request_id,
+                &response_chain,
+                engine.middleware_runner(),
+                Some(engine.generation_guard()),
+            );
+            let Some((client, middleware)) = forwarding
+                .forward(accepted, &req, config, middleware)
+                .await?
+            else {
+                return Ok(());
+            };
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -2110,28 +2164,21 @@ where
             } else {
                 None
             };
-            let req_with_auth = match if ctx.exchange_connection.is_some()
-                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
-                    &response_chain,
-                ) {
-                Ok(req)
-            } else {
-                crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
-            } {
-                Ok(req) => req,
-                Err(e) => {
-                    warn!(
-                        host = %ctx.host,
-                        port = ctx.port,
-                        error = %e,
-                        "Token grant failed in L7 relay"
-                    );
-                    write_bad_gateway_response(client).await?;
-                    return Ok(());
-                }
-            };
-            let scoped_ctx =
-                scoped_context_for_middleware_request(ctx, &req_with_auth, &response_chain);
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "Token grant failed in L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
             // Forward request to upstream and relay response
@@ -2155,24 +2202,6 @@ where
                 host: &ctx.host,
                 port: ctx.port,
             };
-            let middleware = http_response_middleware_relay(
-                &req_with_auth,
-                ctx,
-                ctx.upstream_transport.scheme(),
-                &request_id,
-                &response_chain,
-                engine.middleware_runner(),
-                Some(engine.generation_guard()),
-            );
-            if ctx.exchange_connection.is_some()
-                || openshell_supervisor_middleware::external_exchange::has_external_http_exchange(
-                    &response_chain,
-                )
-            {
-                accepted.relay(&req_with_auth, options, middleware).await?;
-                return Ok(());
-            }
-            let client = accepted.client();
             let outcome_result = relay_http_request_with_credential_rejection(
                 &req_with_auth,
                 client,
@@ -2504,7 +2533,7 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::now_v7().to_string();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
@@ -2809,7 +2838,7 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::now_v7().to_string();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
@@ -3455,7 +3484,7 @@ where
             ocsf_emit!(event);
         }
 
-        let request_id = uuid::Uuid::now_v7().to_string();
+        let request_id = uuid::Uuid::new_v4().to_string();
         let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
@@ -3614,6 +3643,62 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn external_exchange_l7_selection_without_connection_cannot_forward_directly() {
+        let ctx = L7EvalContext {
+            host: "example.test".into(),
+            port: 443,
+            upstream_transport: crate::l7::tls::UpstreamTransport::AuthenticatedTls,
+            ..Default::default()
+        };
+        let chain = [openshell_supervisor_middleware::ChainEntry {
+            external_http_exchange: true,
+            name: "terminal".into(),
+            implementation: "terminal".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let request = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/".into(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        assert_eq!(HttpForwarding::select(&ctx, &[]), HttpForwarding::Direct);
+        let forwarding = HttpForwarding::select(&ctx, &chain);
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let middleware = http_response_middleware_relay(
+            &request,
+            &ctx,
+            "https",
+            &forwarding.request_id(),
+            &chain,
+            &runner,
+            None,
+        );
+        let (mut downstream, mut client) = tokio::io::duplex(256);
+        let accepted =
+            super::super::rest::AcceptedResponseSink::capture(&mut downstream, false).unwrap();
+        let endpoint = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","enforcement":"enforce","host":"example.test","port":443}"#,
+        )
+        .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint).unwrap();
+        assert!(
+            forwarding
+                .forward(accepted, &request, &config, middleware)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(downstream);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 502"));
+    }
 
     #[tokio::test]
     async fn body_denial_returns_actionable_local_json() {

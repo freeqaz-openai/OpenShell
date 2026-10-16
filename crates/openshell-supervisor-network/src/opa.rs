@@ -743,9 +743,7 @@ impl OpaEngine {
                 miette::miette!("external_http_exchange requires typed policy identity")
             })?;
             Some(ExchangeConnection {
-                proof: openshell_core::middleware::VerifiedExchangeOrigin {
-                    policy_hash,
-                },
+                proof: openshell_core::middleware::VerifiedExchangeOrigin { policy_hash },
                 host: input.host.clone(),
                 port: input.port,
                 guard: PolicyGenerationGuard {
@@ -1075,7 +1073,9 @@ impl OpaEngine {
             runner
                 .http_exchange_authority(std::slice::from_ref(entry))
                 .await?
-                .ok_or_else(|| miette::miette!("installed HTTP exchange authority is unavailable"))?;
+                .ok_or_else(|| {
+                    miette::miette!("installed HTTP exchange authority is unavailable")
+                })?;
             // Validate the installed config with this supervisor's authenticated service before
             // reporting enforcement. No ValidateConfig call is added to the protected request path.
             runner

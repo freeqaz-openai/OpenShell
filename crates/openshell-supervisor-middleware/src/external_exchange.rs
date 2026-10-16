@@ -89,7 +89,9 @@ impl ChainRunner {
             .clone()
             .ok_or_else(|| miette!("HTTP exchange authority requires authenticated TLS"))?;
         let MiddlewareDispatch::Grpc(service) = &state.service else {
-            return Err(miette!("HTTP exchange authority requires authenticated TLS"));
+            return Err(miette!(
+                "HTTP exchange authority requires authenticated TLS"
+            ));
         };
         // This version cannot compose another response policy on the protected exchange.
         if entries.len() != 1 {

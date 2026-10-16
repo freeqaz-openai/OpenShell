@@ -159,8 +159,7 @@ pub(super) fn prepare_http_relay<'a>(
     }
 
     // A protected L4 admission must never become an uninspected direct relay.
-    if request.exchange_connection.is_some() && route.is_none_or(|route| route.configs.is_empty())
-    {
+    if request.exchange_connection.is_some() && route.is_none_or(|route| route.configs.is_empty()) {
         return None;
     }
 
