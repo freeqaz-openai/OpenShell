@@ -141,6 +141,20 @@ binary_allowed(_, _) if {
 	not binary_identity_required
 }
 
+# A fresh execution-wide protected grant uses no executable selector. The supervisor sets
+# verified_execution_connect only for an actual blocked workload connect selected by typed
+# execution-authority policy, and carries that exact host/port/generation into REST evaluation.
+# Never relax binary checking for an ordinary endpoint, legacy pin grant or unverified input.
+binary_allowed(policy, _) if {
+	object.get(input.network, "verified_execution_connect", false)
+	count(policy.binaries) == 0
+	some ep in policy.endpoints
+	ep.protocol == "rest"
+	ep.enforcement == "enforce"
+	lower(ep.host) == lower(input.network.host)
+	ep.ports[_] == input.network.port
+}
+
 # Binary matching: exact path.
 # SHA256 integrity is enforced in Rust via trust-on-first-use (TOFU) cache,
 # not in Rego. The proxy computes and caches binary hashes at runtime.
@@ -186,7 +200,9 @@ network_action := "allow" if {
 
 # --- Authoritative egress authorization snapshot ---
 #
-# Rust evaluates this rule once per admitted connection. Keeping the action,
+# Rust evaluates this rule once per admitted connection. Credential-protected
+# hosts additionally require the independent verified-leaf connector gate under
+# the same engine lock; this route result alone never grants credential access. Keeping the action,
 # matched policy, endpoint metadata, and exact-host signal in one result makes
 # them an atomic view of one policy generation.
 

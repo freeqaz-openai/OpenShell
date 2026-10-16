@@ -52,3 +52,41 @@ WebSocket message sequences are allocated session-wide; each stage receives a st
 | Binary WebSocket message passes without a middleware RPC | Binary is unsupported by the V1 text-message binding under both `on_error` modes | `WEBSOCKET_MIDDLEWARE_COVERAGE state=unsupported_message_type`; the next text RPC may have a valid sequence gap |
 | WebSocket messages stop reaching middleware after one failure | A fail-open stage stream was disabled for the rest of the connection | `openshell.middleware.websocket_stage_disabled`; middleware timeout/stream/protocol logs. A per-message capacity bypass alone leaves the stage active. Reconnect to create a fresh stream after a genuine stream failure |
 | Supervisor repeatedly fails to install middleware after enabling gateway JWT signing | Extension credential minting, distribution, or authenticated service connection failed; last-known-good registry remains active | Gateway `RefreshSandboxToken` logs, sandbox configuration events, service token-verification logs, registration TLS/audience settings |
+
+## External STATIC credential authority
+
+For a policy with `credential_authority: true`, require authenticated HTTPS,
+`fail_closed`, operator-admitted `credential_connectors`, and both mandatory
+service capabilities: `openshell.supervisor-middleware.http-credential-access.v1`
+and `openshell.supervisor-middleware.http-credential-verified-connector.v1`.
+This experimental pinned-connector profile requires a verified connecting leaf and both capabilities
+in the current loaded receipt. Allowed ancestors, launcher identities, and
+first-use observations cannot establish authority. Confirm that exactly
+one authority matches the destination and that its manifest includes
+`HTTP_CREDENTIALS/PRE_CREDENTIALS` and `HTTP_RESPONSE/PRE_RETURN`. A legacy
+request-middleware allow is insufficient. Do not remove the authority selection
+or enable insecure transport to make a failing protected request succeed.
+Provider dispatch also requires completed, certificate-verified upstream TLS;
+an HTTPS URL or matching Host header inside a plaintext CONNECT tunnel is
+insufficient. Protected responses discard provider reason phrases and reject
+malformed status lines before release.
+
+The authority receives resolution and final authorization on the same installation exchange. Inspect safe
+request-ID correlation at the authority to distinguish capture/resolution failure
+from final denial. Never collect credential values, operation handles, or raw
+material evidence. The initial protected path stages bounded responses and
+supports finite SSE only after complete buffering and whole-body policy approval,
+within the original 30-second deadline and 4 MiB staged limit. It refuses indefinite
+streaming, compression, upgrades, signing, and plaintext. A 502 after a
+send does not prove that the provider performed no effect; do not automatically
+retry. See this branch's [operation contract](../../../docs/extensibility/supervisor-middleware/operations.mdx#external-static-credentials).
+
+Require current `loaded_enforcement` evidence for protected runtime qualification.
+A gateway capability or `LOADED` status alone is insufficient, especially after
+an upgrade with cached middleware manifests. Follow this branch's operation
+contract for exact policy/configuration/instance matching and invalidation; do
+not treat a saved receipt as permanent readiness.
+For protected calls, require the gateway-validated `instance_id` JWT claim to
+match current evidence and the admitted installation. Initial support targets
+fresh matching gateway/supervisor installs. UUIDv7 creation fixes each operation's
+30-second replay horizon; a later deadline cannot renew the same ID.

@@ -464,12 +464,27 @@ pub struct L7DenyRule {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CredentialConnector {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkBinary {
     pub path: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkMiddleware {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_connectors: Vec<CredentialConnector>,
+    /// Select an exclusive authenticated STATIC credential authority.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub credential_authority: bool,
+    /// An explicit whole-execution grant, never inferred from absent executable pins.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub execution_authority: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub middleware: String,
@@ -745,6 +760,9 @@ fn inspect_document(root: &serde_yml::Value) -> InspectionResult {
                 "order",
                 "config",
                 "on_error",
+                "credential_authority",
+                "execution_authority",
+                "credential_connectors",
                 "endpoints",
             ],
         )? {

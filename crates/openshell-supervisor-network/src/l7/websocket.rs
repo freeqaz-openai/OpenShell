@@ -3783,6 +3783,8 @@ network_policies:
         let preflight = runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "redact-openai".into(),
                     implementation: "openai-redactor".into(),
                     order: 0,
@@ -3858,6 +3860,8 @@ network_policies:
         runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "redact-openai".into(),
                     implementation: "openai-redactor".into(),
                     order: 0,
@@ -4818,6 +4822,8 @@ network_policies:
         let preflight = runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "redact-openai".into(),
                     implementation: "openai-redactor".into(),
                     order: 0,
@@ -4971,6 +4977,8 @@ network_policies:
         let preflight = runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "redact-openai".into(),
                     implementation: "openai-redactor".into(),
                     order: 0,
@@ -5093,6 +5101,8 @@ network_policies:
         let preflight = runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "regex-redactor".into(),
                     implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
                     order: 0,

@@ -29,6 +29,19 @@ pub struct RefreshRequestHash(String);
 
 impl RefreshRequestHash {
     #[must_use]
+    pub fn from_extension_request(names: &[String], instance_id: &str) -> Self {
+        let services = Self::from_extension_services(names);
+        if instance_id.is_empty() {
+            return services;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-refresh-instance-v1\0");
+        digest.update(services.0.as_bytes());
+        digest.update(instance_id.as_bytes());
+        Self(hex::encode(digest.finalize()))
+    }
+
+    #[must_use]
     pub fn from_extension_services(names: &[String]) -> Self {
         let mut digest = Sha256::new();
         digest.update(b"openshell-refresh-v1\0");

@@ -394,7 +394,7 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials`, `HttpResponse/pre_return`, and `WebSocketMessage/pre_credentials`. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials`, `HttpResponse/pre_return`, `WebSocketMessage/pre_credentials`, and `HttpCredentials/pre_credentials`. The credential binding requires the authenticated credential-access capability described below. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
@@ -409,6 +409,15 @@ The service `grpc_endpoint` supports plaintext `http://` and TLS `https://`. HTT
 When `gateway_jwt` is configured, OpenShell attaches short-lived bearer credentials to gateway and supervisor calls and requires `https://`. A middleware endpoint must be reachable from sandbox supervisors, so Unix sockets are not an option here. Set `allow_insecure_transport = true` on a registration to keep a plaintext `http://` endpoint: OpenShell then attaches no credential, supervisors do not request one, and the gateway logs a warning naming the registration at every startup. mTLS client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware Configuration](/extensibility/supervisor-middleware/configure) for attachment, failure, and operational guidance.
+
+A policy entry with `credential_authority: true` requires gateway JWT signing and
+an HTTPS registration without `allow_insecure_transport`. Its service must
+advertise `openshell.supervisor-middleware.http-credential-access.v1`,
+`HTTP_CREDENTIALS/PRE_CREDENTIALS`, and `HTTP_RESPONSE/PRE_RETURN`. The supervisor
+uses one authenticated installation exchange for resolution, final send
+authorization, and approval of the complete response. See the [external static credential
+protocol](/extensibility/supervisor-middleware/operations#external-static-credentials)
+for custody, response limits, and unsupported operations.
 
 ## Gateway Interceptors
 

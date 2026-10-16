@@ -71,6 +71,48 @@ pub struct MatchedEndpoint {
     pub endpoint: regorus::Value,
 }
 
+/// A private admission token produced only from a verified connecting leaf.
+/// It is never reconstructed from request metadata or a process-supplied assertion.
+#[derive(Clone, Debug)]
+pub(crate) struct CredentialConnection {
+    proof: openshell_core::middleware::VerifiedCredentialOrigin,
+    host: String,
+    port: u16,
+    guard: PolicyGenerationGuard,
+}
+
+impl CredentialConnection {
+    pub(crate) fn is_execution_for(
+        &self,
+        host: &str,
+        port: u16,
+        guard: &PolicyGenerationGuard,
+    ) -> Result<bool> {
+        Ok(matches!(
+            self.proof_for(host, port, guard)?,
+            openshell_core::middleware::VerifiedCredentialOrigin::Execution { .. }
+        ))
+    }
+
+    pub(crate) fn proof_for(
+        &self,
+        host: &str,
+        port: u16,
+        guard: &PolicyGenerationGuard,
+    ) -> Result<openshell_core::middleware::VerifiedCredentialOrigin> {
+        self.guard.ensure_current()?;
+        guard.ensure_current()?;
+        if self.host != host
+            || self.port != port
+            || self.guard.captured_generation != guard.captured_generation
+            || !Arc::ptr_eq(&self.guard.current_generation, &guard.current_generation)
+        {
+            return Err(miette::miette!("credential connection binding mismatch"));
+        }
+        Ok(self.proof.clone())
+    }
+}
+
 /// Policy-DNS eligible endpoint metadata captured from one policy generation.
 ///
 /// This is policy data only. It deliberately contains no process identity or
@@ -86,6 +128,7 @@ pub struct PolicyDnsEligibilitySnapshot {
 /// Atomic policy result used to authorize and materialize one egress request.
 #[derive(Debug, Clone)]
 pub struct EgressAuthorization {
+    pub(crate) credential_connection: Option<CredentialConnection>,
     pub action: NetworkAction,
     pub endpoint_configs: Vec<regorus::Value>,
     pub matched_endpoints: Vec<MatchedEndpoint>,
@@ -155,13 +198,34 @@ pub struct SandboxConfig {
 /// because policy evaluation is fast (microseconds) and contention is low
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
-    engine: Mutex<regorus::Engine>,
+    engine: Mutex<InstalledPolicy>,
     binary_identity_required: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
     generation_tx: watch::Sender<u64>,
     fail_closed_reason: RwLock<Option<String>>,
+}
+
+/// The compiled engine and its typed identity are replaced under one lock.
+/// Raw Rego/YAML loads have no trusted canonical typed-policy identity.
+struct InstalledPolicy {
+    engine: regorus::Engine,
+    policy_hash: Option<String>,
+}
+
+impl std::ops::Deref for InstalledPolicy {
+    type Target = regorus::Engine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+impl std::ops::DerefMut for InstalledPolicy {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
 }
 
 #[cfg(test)]
@@ -285,11 +349,18 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
-    fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
+    fn with_engine(
+        engine: regorus::Engine,
+        binary_identity_required: bool,
+        policy_hash: Option<String>,
+    ) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
-            engine: Mutex::new(engine),
+            engine: Mutex::new(InstalledPolicy {
+                engine,
+                policy_hash,
+            }),
             binary_identity_required,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
@@ -371,7 +442,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
-        Ok(Self::with_engine(engine, require_binary_identity))
+        Ok(Self::with_engine(engine, require_binary_identity, None))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -418,7 +489,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
-        Ok(Self::with_engine(engine, require_binary_identity))
+        Ok(Self::with_engine(engine, require_binary_identity, None))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -472,7 +543,7 @@ impl OpaEngine {
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
+        let (data_json_str, policy_hash) = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
@@ -506,7 +577,11 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
-        Ok(Self::with_engine(engine, require_binary_identity))
+        Ok(Self::with_engine(
+            engine,
+            require_binary_identity,
+            Some(policy_hash),
+        ))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -537,6 +612,11 @@ impl OpaEngine {
 
         set_regorus_input(&mut engine, input_json)?;
 
+        if credential_connector_selection(&mut engine, input)?.is_some() {
+            return Err(miette::miette!(
+                "credential connector requires verified connection admission"
+            ));
+        }
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
             .map_err(|e| miette::miette!("{e}"))?;
@@ -583,10 +663,16 @@ impl OpaEngine {
     /// Authorize egress and return all connection metadata from one Rego result
     /// evaluated against one policy generation.
     pub fn authorize_egress(&self, input: &NetworkInput) -> Result<EgressAuthorization> {
+        self.authorize_egress_with_provenance(input, None)
+    }
+
+    pub(super) fn authorize_egress_with_provenance(
+        &self,
+        input: &NetworkInput,
+        provenance: Option<&crate::proxy::transparent_admission::VerifiedTransparentConnect>,
+    ) -> Result<EgressAuthorization> {
         #[cfg(test)]
         record_test_opa_query();
-
-        let input_json = network_input_json(input);
 
         let mut engine = self
             .engine
@@ -601,6 +687,7 @@ impl OpaEngine {
             .clone();
         if let Some(reason) = fail_closed_reason {
             return Ok(EgressAuthorization {
+                credential_connection: None,
                 action: NetworkAction::Deny { reason },
                 endpoint_configs: Vec::new(),
                 matched_endpoints: Vec::new(),
@@ -609,6 +696,17 @@ impl OpaEngine {
             });
         }
 
+        let profile = credential_connector_selection(&mut engine, input)?;
+        let mut input_json = network_input_json(input);
+        if matches!(profile, Some(CredentialProfile::Execution)) {
+            if provenance.is_none() {
+                return Err(miette::miette!(
+                    "execution authority requires verified workload connect"
+                ));
+            }
+            // A trusted, destination-selected input; never copied from the workload or a request field.
+            input_json["network"]["verified_execution_connect"] = true.into();
+        }
         set_regorus_input(&mut engine, input_json)?;
 
         let result = engine
@@ -629,6 +727,62 @@ impl OpaEngine {
         let exact_declared_endpoint_host =
             get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
+        let credential_connection = if let Some(profile) = profile
+            && action_str == "allow"
+        {
+            if provenance.is_none() {
+                return Err(miette::miette!(
+                    "credential connector requires verified connection identity"
+                ));
+            }
+            if matches!(profile, CredentialProfile::Execution)
+                && (endpoint_configs.is_empty()
+                    || endpoint_configs.iter().any(|ep| {
+                        get_str(ep, "protocol").as_deref() != Some("rest")
+                            || get_str(ep, "enforcement").as_deref() != Some("enforce")
+                            || get_str(ep, "host")
+                                .is_none_or(|h| !input.host.eq_ignore_ascii_case(&h))
+                    }))
+            {
+                return Err(miette::miette!(
+                    "execution authority requires unambiguous enforced REST destination"
+                ));
+            }
+            let policy_hash = engine.policy_hash.clone().ok_or_else(|| {
+                miette::miette!("credential connector requires typed policy identity")
+            })?;
+            Some(CredentialConnection {
+                proof: match profile {
+                    CredentialProfile::Execution => {
+                        openshell_core::middleware::VerifiedCredentialOrigin::Execution {
+                            policy_hash,
+                        }
+                    }
+                    CredentialProfile::Connector => {
+                        openshell_core::middleware::VerifiedCredentialOrigin::Connector(
+                            openshell_core::proto::VerifiedCredentialConnector {
+                                path: input
+                                    .binary_path
+                                    .to_str()
+                                    .ok_or_else(|| miette::miette!("noncanonical connector path"))?
+                                    .to_string(),
+                                sha256: input.binary_sha256.clone(),
+                                policy_hash,
+                            },
+                        )
+                    }
+                },
+                host: input.host.clone(),
+                port: input.port,
+                guard: PolicyGenerationGuard {
+                    captured_generation: generation,
+                    current_generation: Arc::clone(&self.generation),
+                    generation_rx: self.generation_tx.subscribe(),
+                },
+            })
+        } else {
+            None
+        };
         let action = if action_str == "allow" {
             NetworkAction::Allow { matched_policy }
         } else {
@@ -640,6 +794,7 @@ impl OpaEngine {
         };
 
         Ok(EgressAuthorization {
+            credential_connection,
             action,
             endpoint_configs,
             matched_endpoints,
@@ -708,12 +863,13 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *engine = new_engine;
-        *self
+        let mut fail_closed_reason = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
         self.advance_generation();
+        *engine = new_engine;
+        *fail_closed_reason = None;
         Ok(())
     }
 
@@ -892,6 +1048,122 @@ impl OpaEngine {
             .read()
             .map(|runner| runner.clone())
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))
+    }
+
+    /// Inspect the installed policy and its registry, never the desired gateway
+    /// document. A cached manifest without the required binding/capability fails
+    /// here even when a policy-only reload retained that registry.
+    pub async fn enforced_capabilities(
+        &self,
+        generation: &PolicyGenerationGuard,
+    ) -> Result<Vec<String>> {
+        self.installed_enforcement(generation)
+            .await
+            .map(|(_, capabilities)| capabilities)
+    }
+
+    async fn installed_enforcement(
+        &self,
+        generation: &PolicyGenerationGuard,
+    ) -> Result<(Option<String>, Vec<String>)> {
+        let (policy_hash, entries, runner) = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+            if !Arc::ptr_eq(&generation.current_generation, &self.generation)
+                || generation.is_stale()
+                || self
+                    .fail_closed_reason
+                    .read()
+                    .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+                    .is_some()
+            {
+                return Err(miette::miette!("runtime generation is not active"));
+            }
+            let configs = engine
+                .eval_rule("data.openshell.sandbox.network_middlewares".into())
+                .map_err(|_| {
+                    miette::miette!("installed middleware configuration is unavailable")
+                })?;
+            let entries = parse_middleware_configs(&configs)?
+                .iter()
+                .map(chain_entry_from_value)
+                .collect::<Result<Vec<_>>>()?;
+            (
+                engine.policy_hash.clone(),
+                entries,
+                self.middleware_runner()?,
+            )
+        };
+        let mut capabilities = Vec::new();
+        for entry in entries.iter().filter(|entry| entry.credential_authority) {
+            runner
+                .credential_authority(std::slice::from_ref(entry))
+                .await?
+                .ok_or_else(|| miette::miette!("installed credential authority is unavailable"))?;
+            // Validate the installed config with this supervisor's authenticated service before
+            // reporting enforcement. No ValidateConfig call is added to the protected request path.
+            runner
+                .validate_config(&entry.implementation, entry.config.clone())
+                .await?;
+            let profile = openshell_core::extension_protocol::credential_enforcement_profile(
+                entry.execution_authority,
+            );
+            if capabilities.is_empty() {
+                capabilities.extend(profile.iter().copied().map(str::to_string));
+            } else if capabilities != profile {
+                return Err(miette::miette!("cannot mix credential authority profiles"));
+            }
+        }
+        if generation.is_stale() {
+            return Err(miette::miette!(
+                "runtime generation changed during capability validation"
+            ));
+        }
+        Ok((policy_hash, capabilities))
+    }
+
+    /// Bind installed enforcement to the configuration identity captured by the
+    /// supervisor's successful load/reconciliation. The caller must retain the
+    /// generation returned by that install, rather than sample a later one.
+    pub async fn loaded_enforcement_evidence(
+        &self,
+        generation: &PolicyGenerationGuard,
+        sandbox_id: &str,
+        admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    ) -> Result<openshell_core::proto::LoadedEnforcementEvidence> {
+        if admission.state
+            != i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        {
+            return Err(miette::miette!(
+                "enforcement requires successful configuration installation"
+            ));
+        }
+        let (policy_hash, enforced_capabilities) = self.installed_enforcement(generation).await?;
+        let policy_hash = policy_hash.ok_or_else(|| {
+            miette::miette!("installed policy has no canonical typed-policy identity")
+        })?;
+        if policy_hash != admission.policy_hash {
+            return Err(miette::miette!(
+                "installed policy hash does not match accepted configuration"
+            ));
+        }
+        // Capability validation can await middleware. Reacquire the reload lock
+        // before publishing, so a concurrent policy/registry/quarantine change
+        // cannot pair a captured hash with another installed generation.
+        self.with_current_generation(generation.captured_generation(), |_| {
+            openshell_core::proto::LoadedEnforcementEvidence {
+                sandbox_id: sandbox_id.to_string(),
+                instance_id: admission.instance_id.clone(),
+                policy_version: admission.policy_version,
+                policy_hash,
+                config_revision: admission.config_revision,
+                provider_env_revision: admission.provider_env_revision,
+                enforced_capabilities,
+            }
+        })?
+        .ok_or_else(|| miette::miette!("runtime generation changed before enforcement publication"))
     }
 
     /// Test-only: swap the middleware runner without a connected registry, so
@@ -1108,7 +1380,7 @@ impl OpaEngine {
             ));
         }
         Ok(TunnelPolicyEngine {
-            engine: Mutex::new(engine.clone()),
+            engine: Mutex::new(engine.engine.clone()),
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
@@ -1212,6 +1484,73 @@ pub(crate) fn set_regorus_input(
     Ok(())
 }
 
+enum CredentialProfile {
+    Connector,
+    Execution,
+}
+
+fn credential_connector_selection(
+    engine: &mut regorus::Engine,
+    input: &NetworkInput,
+) -> Result<Option<CredentialProfile>> {
+    let value = engine
+        .eval_rule("data.openshell.sandbox.network_middlewares".into())
+        .map_err(|error| miette::miette!("{error}"))?;
+    let configs = parse_middleware_configs(&value)?;
+    let mut selected = None;
+    for config in &configs {
+        if get_bool(config, "credential_authority") != Some(true) {
+            continue;
+        }
+        let selector = get_field(config, "endpoints")
+            .ok_or_else(|| miette::miette!("credential connector selector is missing"))?;
+        let include = get_str_array(selector, "include");
+        if include.len() != 1
+            || include[0].contains(['*', '?', '[', ']'])
+            || !get_str_array(selector, "exclude").is_empty()
+        {
+            return Err(miette::miette!("unsupported credential connector selector"));
+        }
+        if !middleware_selector_matches(config, &input.host)? {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(miette::miette!("ambiguous credential authority selection"));
+        }
+        selected = Some(config);
+    }
+    let Some(config) = selected else {
+        return Ok(None);
+    };
+    let Some(regorus::Value::Array(pins)) = get_field(config, "credential_connectors") else {
+        return Err(miette::miette!("missing credential connector pins"));
+    };
+    if get_bool(config, "execution_authority") == Some(true) {
+        if !pins.is_empty() {
+            return Err(miette::miette!(
+                "execution authority cannot reinterpret connector pins"
+            ));
+        }
+        return Ok(Some(CredentialProfile::Execution));
+    }
+    if pins.is_empty()
+        || pins.len() > 64
+        || pins.iter().any(|pin| {
+            !openshell_core::middleware::valid_credential_connector(
+                &get_str(pin, "path").unwrap_or_default(),
+                &get_str(pin, "sha256").unwrap_or_default(),
+            )
+        })
+        || !pins.iter().any(|pin| {
+            get_str(pin, "path").as_deref() == input.binary_path.to_str()
+                && get_str(pin, "sha256").as_deref() == Some(input.binary_sha256.as_str())
+        })
+    {
+        return Err(miette::miette!("credential connector leaf is not admitted"));
+    }
+    Ok(Some(CredentialProfile::Connector))
+}
+
 fn query_middleware_chain_locked(
     engine: &mut regorus::Engine,
     input: &NetworkInput,
@@ -1289,6 +1628,11 @@ fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
     let implementation = get_str(value, "middleware").unwrap_or_default();
     Ok(ChainEntry {
         name,
+        execution_authority: get_bool(value, "execution_authority") == Some(true),
+        credential_authority: matches!(
+            get_field(value, "credential_authority"),
+            Some(regorus::Value::Bool(true))
+        ),
         implementation,
         order: get_field(value, "order")
             .and_then(|value| match value {
@@ -2216,7 +2560,8 @@ fn l7_matchers_to_json(
         .collect()
 }
 
-/// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
+/// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`
+/// and retain the canonical typed identity used by that projection.
 ///
 /// The rego rules reference `data.*` directly, so the JSON structure has
 /// top-level keys matching the data expectations:
@@ -2231,7 +2576,7 @@ fn l7_matchers_to_json(
 /// user-specified symlink paths (e.g., `/usr/bin/python3`) match the
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
-fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> (String, String) {
     let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
@@ -2558,6 +2903,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             let mut value = serde_json::json!({
                 "middleware": mw.middleware,
                 "order": mw.order,
+                "credential_authority": mw.credential_authority,
+                "execution_authority": mw.execution_authority,
+                "credential_connectors": mw.credential_connectors.iter().map(|pin| serde_json::json!({"path": pin.path, "sha256": pin.sha256})).collect::<Vec<_>>(),
             });
             if !mw.name.is_empty() {
                 value["name"] = mw.name.clone().into();
@@ -2582,14 +2930,166 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         })
         .collect();
 
-    serde_json::json!({
+    let data = serde_json::json!({
         "filesystem_policy": filesystem_policy,
         "landlock": landlock,
         "process": process,
         "network_policies": network_policies,
         "network_middlewares": network_middlewares,
     })
-    .to_string()
+    .to_string();
+    (data, policy_hash)
+}
+
+#[cfg(test)]
+mod credential_connector_tests {
+    use super::*;
+    use openshell_core::proto::{
+        CredentialConnector, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
+        NetworkMiddlewareConfig, NetworkPolicyRule,
+    };
+
+    fn policy() -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "ordinary".into(),
+            NetworkPolicyRule {
+                name: "ordinary".into(),
+                endpoints: ["protected.test", "unrelated.test"]
+                    .into_iter()
+                    .map(|host| NetworkEndpoint {
+                        host: host.into(),
+                        ports: vec![443],
+                        ..Default::default()
+                    })
+                    .collect(),
+                binaries: vec![NetworkBinary {
+                    path: "/bin/allowed".into(),
+                }],
+            },
+        );
+        policy.network_middlewares.insert(
+            "protected".into(),
+            NetworkMiddlewareConfig {
+                middleware: "test/authority".into(),
+                credential_authority: true,
+                execution_authority: false,
+                credential_connectors: vec![
+                    CredentialConnector {
+                        path: "/bin/allowed".into(),
+                        sha256: "a".repeat(64),
+                    },
+                    CredentialConnector {
+                        path: "/bin/other".into(),
+                        sha256: "b".repeat(64),
+                    },
+                ],
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["protected.test".into()],
+                    exclude: vec![],
+                }),
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn input() -> NetworkInput {
+        NetworkInput {
+            host: "protected.test".into(),
+            port: 443,
+            binary_path: "/bin/allowed".into(),
+            binary_sha256: "a".repeat(64),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn connector_pins_are_independent_of_ordinary_ancestor_and_endpoint_authority() {
+        let policy = policy();
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        let allowed = input();
+        let (raw_data, _) = proto_to_opa_data_json(&policy, 0);
+        let raw = OpaEngine::from_strings(BAKED_POLICY_RULES, &raw_data).unwrap();
+        assert!(
+            raw.authorize_egress(&allowed).is_err(),
+            "raw unverified input cannot issue proof"
+        );
+        assert!(
+            engine.authorize_egress(&allowed).is_err(),
+            "unverified input cannot issue proof"
+        );
+        let mut child = input();
+        child.binary_path = "/bin/child".into();
+        child.ancestors = vec!["/bin/allowed".into()];
+        assert!(engine.authorize_egress(&child).is_err());
+        child.host = "unrelated.test".into();
+        assert!(matches!(
+            engine.authorize_egress(&child).unwrap().action,
+            NetworkAction::Allow { .. }
+        ));
+        let mut no_route = policy.clone();
+        no_route.network_policies.clear();
+        let no_route = OpaEngine::from_proto(&no_route).unwrap();
+        let denied = no_route.authorize_egress(&allowed).unwrap();
+        assert!(matches!(denied.action, NetworkAction::Deny { .. }));
+        assert!(denied.credential_connection.is_none());
+        let mut crossed = input();
+        crossed.binary_sha256 = "b".repeat(64);
+        assert!(engine.authorize_egress(&crossed).is_err());
+        let relaxed =
+            OpaEngine::from_proto_with_pid_and_binary_identity_required(&policy, 0, false).unwrap();
+        let mut no_identity = input();
+        no_identity.binary_path = PathBuf::new();
+        no_identity.binary_sha256.clear();
+        assert!(relaxed.authorize_egress(&no_identity).is_err());
+    }
+
+    #[test]
+    fn execution_authority_cannot_be_asserted_by_unverified_host_or_workload_input() {
+        let mut policy = policy();
+        let grant = policy.network_middlewares.get_mut("protected").unwrap();
+        grant.execution_authority = true;
+        grant.credential_connectors.clear();
+        for rule in policy.network_policies.values_mut() {
+            rule.binaries.clear();
+        }
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        // This is the actual entry point for a request with no private blocked-connect provenance.
+        assert!(engine.authorize_egress(&input()).is_err());
+    }
+
+    #[test]
+    fn malformed_empty_and_ambiguous_connector_selection_never_admits() {
+        for variant in 0..8 {
+            let mut policy = policy();
+            let entry = policy.network_middlewares.get_mut("protected").unwrap();
+            match variant {
+                0 => entry.credential_connectors.clear(),
+                1 => entry.credential_connectors[0].path = "/bin/../allowed".into(),
+                2 => entry.credential_connectors[0].sha256 = "A".repeat(64),
+                3 => entry.credential_connectors[0].sha256 = "a".repeat(63),
+                4 => entry.endpoints.as_mut().unwrap().include = vec!["*.test".into()],
+                5 => entry.credential_authority = false,
+                6 => entry.credential_connectors = vec![entry.credential_connectors[0].clone(); 65],
+                _ => entry.endpoints.as_mut().unwrap().exclude = vec!["skip.test".into()],
+            }
+            assert!(OpaEngine::from_proto(&policy).is_err(), "variant {variant}");
+        }
+        let mut policy = policy();
+        let mut duplicate = policy.network_middlewares["protected"].clone();
+        duplicate.order = 1;
+        duplicate.credential_connectors[0].sha256 = "b".repeat(64);
+        policy
+            .network_middlewares
+            .insert("second".into(), duplicate);
+        let engine = OpaEngine::from_proto(&policy).unwrap();
+        assert!(
+            engine.authorize_egress(&input()).is_err(),
+            "cannot union conflicting selections"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3397,8 +3897,9 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
-            .expect("protobuf policy projection must produce JSON");
+        let projected: serde_json::Value =
+            serde_json::from_str(&proto_to_opa_data_json(&proto, 0).0)
+                .expect("protobuf policy projection must produce JSON");
         projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
             .as_object()
             .expect("projected allow rule must be an object")
@@ -5834,7 +6335,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine::with_engine(rego, true);
+        let engine = OpaEngine::with_engine(rego, true, None);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -8239,6 +8740,98 @@ network_policies:
         assert_eq!(engine.current_generation(), 1);
     }
 
+    #[tokio::test]
+    async fn enforcement_identity_is_atomic_with_reload_and_absent_after_raw_reload() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let source = openshell_policy::restrictive_default_policy();
+        let engine = Arc::new(OpaEngine::from_proto(&source).unwrap());
+        let old_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let mut candidate = source.clone();
+        candidate
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .read_only
+            .push("/opt".into());
+        let candidate =
+            openshell_policy::validate_and_canonicalize_sandbox_policy(candidate).unwrap();
+        let admission = SandboxConfigurationAdmission {
+            state: ConfigurationAdmissionState::Accepted.into(),
+            policy_hash: deterministic_policy_hash(&candidate),
+            ..Default::default()
+        };
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_engine = Arc::clone(&engine);
+        let writer = std::thread::spawn(move || {
+            writer_engine.reload_configuration_from_proto_with_pid(&candidate, 0, None, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The generation advances before the commit callback. Readers must
+        // remain excluded until both the compiled policy and hash are installed.
+        let stale = old_guard.is_stale();
+        let readers_blocked = matches!(
+            engine.engine.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release_tx.send(()).unwrap();
+        let installed_guard = writer.join().unwrap().unwrap();
+        assert!(stale);
+        assert!(readers_blocked);
+        assert!(
+            engine
+                .loaded_enforcement_evidence(&old_guard, "sandbox", &admission)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .loaded_enforcement_evidence(&installed_guard, "sandbox", &admission)
+                .await
+                .unwrap()
+                .policy_hash,
+            admission.policy_hash
+        );
+        engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .unwrap();
+        assert!(installed_guard.is_stale());
+        let registry_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        assert_eq!(
+            engine
+                .loaded_enforcement_evidence(&registry_guard, "sandbox", &admission)
+                .await
+                .unwrap()
+                .policy_hash,
+            admission.policy_hash
+        );
+
+        // A raw load must not inherit the previous typed generation's hash.
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+        let raw_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let error = engine
+            .loaded_enforcement_evidence(&raw_guard, "sandbox", &admission)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no canonical typed-policy identity")
+        );
+    }
+
     #[test]
     fn policy_generation_does_not_increment_on_failed_reload() {
         let engine = l7_engine();
@@ -10530,7 +11123,8 @@ process:
         // With pid=0, proto_to_opa_data_json should produce the same output
         // as the original (no symlink expansion)
         let proto = test_proto();
-        let data_no_pid = proto_to_opa_data_json(&proto, 0);
+        let (data_no_pid, policy_hash) = proto_to_opa_data_json(&proto, 0);
+        assert_eq!(policy_hash, deterministic_policy_hash(&proto));
         let parsed: serde_json::Value = serde_json::from_str(&data_no_pid).unwrap();
 
         // Verify the claude_code policy has exactly 1 binary entry (no expansion)
@@ -11098,6 +11692,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "regex".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -11128,6 +11724,8 @@ network_policies:
             .expect("install registry");
         let old_runner = engine.middleware_runner().expect("old runner");
         let entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "regex".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -11297,6 +11895,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "regex".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -11401,6 +12001,8 @@ network_policies:
         assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
 
         let entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "regex".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -11837,6 +12439,56 @@ process:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "HEAD", "/repos/myorg/foo");
         assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn credential_authority_survives_policy_conversion_and_selection() {
+        let mut proto = test_proto();
+        proto.network_policies.insert(
+            "authority_api".into(),
+            NetworkPolicyRule {
+                name: "authority_api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".into(),
+                }],
+            },
+        );
+        proto.network_middlewares.insert(
+            "protected".into(),
+            NetworkMiddlewareConfig {
+                middleware: "test/authority".into(),
+                credential_authority: true,
+                execution_authority: false,
+                credential_connectors: vec![openshell_core::proto::CredentialConnector {
+                    path: "/usr/bin/curl".into(),
+                    sha256: "a".repeat(64),
+                }],
+                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".into()],
+                    exclude: vec![],
+                }),
+                ..Default::default()
+            },
+        );
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let (chain, _) = engine
+            .query_middleware_chain_with_generation(&NetworkInput {
+                host: "api.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert!(chain[0].credential_authority);
+        assert_eq!(chain[0].implementation, "test/authority");
     }
 
     #[test]

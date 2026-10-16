@@ -7,6 +7,8 @@
 //! policy, and relays allowed requests to upstream. Handles Content-Length
 //! and chunked transfer encoding for body framing.
 
+mod credentials;
+pub(super) use credentials::AcceptedResponseSink;
 mod http_response;
 
 pub(crate) use http_response::{
@@ -56,6 +58,8 @@ async fn max_middleware_body_bytes() -> usize {
             .expect("built-in middleware service"),
     )
     .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
+        credential_authority: false,
+        execution_authority: false,
         name: "test".into(),
         implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
         order: 0,
@@ -884,6 +888,15 @@ where
 {
     let mut observed_upstream = ObservedUpstream { upstream, observer };
     let upstream = &mut observed_upstream;
+    if let Some(middleware) = response_middleware.as_ref()
+        && openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain)
+    {
+        // Protected traffic must come from the REST owner that captured the actual response
+        // sink at acceptance. Never reconstruct its custody here or enter a legacy resolver.
+        return Err(miette!(
+            "protected operation has no accepted response custody"
+        ));
+    }
     ensure_credential_generation_current(options)?;
     let header_end = req
         .raw_header
@@ -2484,7 +2497,7 @@ pub(crate) fn upgrade_refusal_for_protocol(
 /// upstream `101` may reach the client. A refusal based on this test therefore
 /// covers every request either one treats as an upgrade. Headers that are not
 /// UTF-8 return false; the shared relay rejects them before forwarding.
-fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
+pub(super) fn request_has_upgrade_header(raw_header: &[u8]) -> bool {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -6625,6 +6638,8 @@ mod tests {
                 captured_preflight_headers: Some(Arc::clone(&captured)),
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,
@@ -6767,6 +6782,8 @@ mod tests {
                 captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,
@@ -6782,6 +6799,8 @@ mod tests {
         method: &str,
     ) -> HttpResponseMiddlewareRelay<'a> {
         HttpResponseMiddlewareRelay {
+            credential_connection: None,
+            upstream_transport: crate::l7::tls::UpstreamTransport::Plaintext,
             chain,
             runner,
             request_context: RequestContext {
@@ -7033,6 +7052,8 @@ mod tests {
                 captured_preflight_headers: None,
             }));
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "response".into(),
             implementation: "test/response-relay".into(),
             order: 0,

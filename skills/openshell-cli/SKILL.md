@@ -585,6 +585,21 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
+For the experimental pinned-connector `credential_authority: true` profile, verify both
+mandatory credential-access and verified-connector capabilities, operator-admitted
+`credential_connectors`, and authenticated HTTPS registration. Require the
+verified connecting leaf and both capabilities in the current loaded receipt;
+a launcher identity, allowed ancestor, or first-use observation is insufficient. This path
+resolves and authorizes the send on the same installation exchange and has no ordinary
+provider fallback. Follow this branch's [credential protocol](../../docs/extensibility/supervisor-middleware/operations.mdx#external-static-credentials)
+for supported operations; do not infer this capability from a legacy middleware
+or provider readiness result. Require current loaded enforcement evidence and
+exact policy/configuration identity as described in that contract; a stored
+receipt does not establish permanent readiness.
+Protected extension calls must also carry a gateway-validated registered-instance
+claim matching current evidence. Follow the contract's fresh-install and UUIDv7
+operation-lifetime requirements; mixed-version hot activation is not qualified.
+
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in
 `openshell/regex` supports request bodies and client WebSocket text messages.

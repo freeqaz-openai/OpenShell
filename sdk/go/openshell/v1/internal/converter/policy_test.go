@@ -661,10 +661,11 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 		Version: 5,
 		NetworkMiddlewares: map[string]v1.NetworkMiddlewareConfig{
 			"rate-limiter": {
-				Name:       "rate-limiter",
-				Middleware: "envoy-ratelimit",
-				OnError:    "fail_open",
-				Order:      20,
+				Name:                "rate-limiter",
+				Middleware:          "envoy-ratelimit",
+				OnError:             "fail_closed",
+				CredentialAuthority: true,
+				Order:               20,
 				Config: map[string]any{
 					"requests_per_second": float64(100),
 				},
@@ -687,6 +688,7 @@ func TestSandboxPolicyMiddlewareRoundTrip(t *testing.T) {
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Middleware, mw.Middleware)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].OnError, mw.OnError)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Order, mw.Order)
+	assert.True(t, mw.CredentialAuthority)
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Config["requests_per_second"], mw.Config["requests_per_second"])
 	assert.Equal(t, original.NetworkMiddlewares["rate-limiter"].Endpoints.Include, mw.Endpoints.Include)
 }
@@ -706,4 +708,22 @@ func TestSandboxPolicyMiddlewareDeepCopy(t *testing.T) {
 	proto.NetworkMiddlewares["test"].Endpoints.Include[0] = "mutated.com"
 
 	assert.Equal(t, "original.com", policy.NetworkMiddlewares["test"].Endpoints.Include[0])
+}
+
+func TestLoadedEnforcementEvidencePreservesIdentityAndOwnsCapabilities(t *testing.T) {
+	wire := &pb.GetSandboxPolicyStatusResponse{LoadedEnforcement: &pb.LoadedEnforcementEvidence{
+		SandboxId: "immutable-sandbox", InstanceId: "registration", PolicyVersion: 7,
+		PolicyHash: "digest", ConfigRevision: 41, ProviderEnvRevision: 43,
+		EnforcedCapabilities: []string{"openshell.supervisor-middleware.http-credential-access.v1"},
+	}}
+	got := PolicyStatusResultFromProto(wire).LoadedEnforcement
+	assert.Equal(t, "immutable-sandbox", got.SandboxID)
+	assert.Equal(t, "registration", got.InstanceID)
+	assert.Equal(t, uint32(7), got.PolicyVersion)
+	assert.Equal(t, "digest", got.PolicyHash)
+	assert.Equal(t, uint64(41), got.ConfigRevision)
+	assert.Equal(t, uint64(43), got.ProviderEnvRevision)
+	wire.LoadedEnforcement.EnforcedCapabilities[0] = "mutated"
+	assert.Equal(t, []string{"openshell.supervisor-middleware.http-credential-access.v1"}, got.EnforcedCapabilities)
+	assert.Nil(t, PolicyStatusResultFromProto(&pb.GetSandboxPolicyStatusResponse{}).LoadedEnforcement)
 }

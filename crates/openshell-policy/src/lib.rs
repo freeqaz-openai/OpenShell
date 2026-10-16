@@ -2069,6 +2069,10 @@ network_middlewares:
       mode: redact
   secondary-redactor:
     middleware: openshell/regex
+    credential_authority: true
+    credential_connectors:
+      - path: /usr/bin/curl
+        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -2083,6 +2087,7 @@ network_policies:
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto.network_middlewares.len(), 2);
+        assert!(proto.network_middlewares["secondary-redactor"].credential_authority);
         let redactor = &proto.network_middlewares["global-redactor"];
         assert_eq!(redactor.name, "Global redactor");
         assert_eq!(redactor.middleware, "openshell/regex");
@@ -2934,6 +2939,9 @@ network_policies:
 
     fn middleware_config(implementation: &str) -> openshell_core::proto::NetworkMiddlewareConfig {
         openshell_core::proto::NetworkMiddlewareConfig {
+            credential_connectors: Vec::new(),
+            credential_authority: false,
+            execution_authority: false,
             name: String::new(),
             middleware: implementation.into(),
             order: 0,

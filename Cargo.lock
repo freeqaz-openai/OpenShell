@@ -4342,6 +4342,7 @@ dependencies = [
 name = "openshell-extension-core"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "http 1.4.0",
  "hyper-util",
  "rcgen",
@@ -4353,6 +4354,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower",
+ "uuid",
 ]
 
 [[package]]
@@ -4677,6 +4679,7 @@ dependencies = [
  "openshell-providers",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "openshell-supervisor-network",
  "opentelemetry",
  "opentelemetry_sdk",
  "petname",
@@ -4777,9 +4780,11 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "prost",
  "prost-types",
+ "sha2 0.10.9",
  "tokio",
  "tokio-stream",
  "tonic",
+ "zeroize",
 ]
 
 [[package]]
@@ -4805,6 +4810,7 @@ dependencies = [
  "apollo-parser",
  "async-trait",
  "aws-credential-types",
+ "aws-lc-rs",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "base64 0.22.1",
@@ -4816,17 +4822,20 @@ dependencies = [
  "hickory-proto",
  "http 1.4.0",
  "ipnet",
+ "jsonwebtoken",
  "libc",
  "miette",
  "noyalib",
  "openshell-binary-identity",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-policy-schema",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
+ "prost",
  "prost-types",
  "rcgen",
  "regorus",
@@ -4852,6 +4861,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
@@ -4867,6 +4877,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-extension-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
  "rand 0.10.2",

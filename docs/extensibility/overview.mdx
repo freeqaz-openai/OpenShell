@@ -116,6 +116,7 @@ When the gateway has JWT signing configured, OpenShell sends a short-lived beare
 | `aud` | The registration's `audience`. Defaults to `urn:openshell:extension:interceptor:<name>` or `urn:openshell:extension:middleware:<name>`. |
 | `caller_kind` | `gateway`, or `supervisor` for middleware calls from a sandbox. |
 | `sandbox_id` | The calling sandbox, when `caller_kind` is `supervisor`. |
+| `instance_id` | The gateway-validated configuration registration UUID for a supervisor that requested credentials with its own current registration. Absent for gateway callers and legacy unbound credentials. |
 
 ### Validate Each Token
 
@@ -127,6 +128,7 @@ For each request, check that:
 - The signature, expiry, and exact audience are valid.
 - `iss` is `openshell-gateway:<gateway_id>`, not the gateway URL.
 - `caller_kind` and `sandbox_id` match what your service accepts.
+- Protected credential operations also require `instance_id` to match the admitted installation and freshly queried loaded enforcement evidence. This is a registered-instance claim, not process or binary attestation.
 
 OpenShell reuses a token until it rotates, so don't reject a repeated `jti`.
 

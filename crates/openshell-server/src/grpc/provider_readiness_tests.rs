@@ -72,6 +72,7 @@ fn hello() -> SupervisorHello {
         instance_id: Uuid::new_v4().to_string(),
         connection_epoch: 0,
         supports_provider_readiness: true,
+        exchange_public_key: Vec::new(),
     }
 }
 
@@ -1371,4 +1372,49 @@ async fn detach_receipt_persists_but_gateway_restart_requires_fresh_installation
         .status
         .unwrap();
     assert_eq!(changed.state, ProviderReadinessState::Superseded as i32);
+}
+
+#[test]
+fn exchange_key_is_owned_by_the_current_hello_and_instance() {
+    let registry = TestRegistry::default();
+    let mut first = hello();
+    first.exchange_public_key = vec![7; 32];
+    let session = registry.register(&first).unwrap();
+    let evidence = registry.snapshot(&first.sandbox_id).unwrap().unwrap();
+    assert_eq!(
+        evidence.exchange_key(&first.instance_id),
+        Some(&[7; 32][..])
+    );
+    assert_eq!(evidence.exchange_key(&Uuid::new_v4().to_string()), None);
+
+    // A replacement without enrollment must not inherit its predecessor's key.
+    let mut replacement = first.clone();
+    replacement.instance_id = Uuid::new_v4().to_string();
+    replacement.exchange_public_key.clear();
+    let current = registry.register(&replacement).unwrap();
+    registry.disconnect(&first.sandbox_id, &session);
+    let evidence = registry.snapshot(&first.sandbox_id).unwrap().unwrap();
+    assert_eq!(evidence.exchange_key(&first.instance_id), None);
+    assert_eq!(evidence.exchange_key(&replacement.instance_id), None);
+    registry.disconnect(&first.sandbox_id, &current);
+    assert!(registry.snapshot(&first.sandbox_id).unwrap().is_none());
+}
+
+#[test]
+fn malformed_exchange_key_cannot_replace_a_current_session() {
+    let registry = TestRegistry::default();
+    let mut first = hello();
+    first.exchange_public_key = vec![3; 32];
+    registry.register(&first).unwrap();
+    let mut malformed = first.clone();
+    malformed.exchange_public_key.pop();
+    assert!(registry.register(&malformed).is_err());
+    assert_eq!(
+        registry
+            .snapshot(&first.sandbox_id)
+            .unwrap()
+            .unwrap()
+            .exchange_key(&first.instance_id),
+        Some(&[3; 32][..])
+    );
 }

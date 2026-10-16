@@ -17,6 +17,15 @@ for current behavior.
 
 ## Diagnostic Workflow
 
+If policy selects `credential_authority: true`, diagnose its authenticated
+external service before ordinary provider substitution. It requires a distinct
+pair of mandatory credential-access and verified-connector capabilities,
+operator-admitted leaf pins, two online checks, and response policy. This is a
+experimental pinned-connector protocol; allowed ancestors and first-use observations do not
+establish connector authority, and both capabilities must be in the loaded receipt;
+legacy provider readiness is not evidence for that path. See this branch's
+[credential protocol](../../docs/extensibility/supervisor-middleware/operations.mdx#external-static-credentials).
+
 ### 1. Confirm Gateway and Sandbox Context
 
 ```bash

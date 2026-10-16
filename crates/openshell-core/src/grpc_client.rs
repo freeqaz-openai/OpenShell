@@ -438,6 +438,7 @@ async fn refresh_token_loop(
         match client
             .refresh_sandbox_token(RefreshSandboxTokenRequest {
                 extension_service_names: Vec::new(),
+                configuration_instance_id: String::new(),
             })
             .await
         {
@@ -551,6 +552,7 @@ async fn refresh_extension_credentials_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     store: &ExtensionCredentialStore,
     services: &[crate::proto::SupervisorMiddlewareService],
+    configuration_instance_id: &str,
 ) -> Result<HashMap<String, BearerTokenSlot>> {
     let names = authenticated_service_names(services);
     if names.is_empty() {
@@ -560,6 +562,7 @@ async fn refresh_extension_credentials_with_client(
     let response = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
             extension_service_names: names.clone(),
+            configuration_instance_id: configuration_instance_id.to_string(),
         })
         .await
         .into_diagnostic()
@@ -907,18 +910,31 @@ pub async fn fetch_settings_snapshot(
 ) -> Result<SettingsPollResult> {
     debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
     let mut client = connect(endpoint).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await
+    fetch_settings_snapshot_with_client(&mut client, sandbox_name, None, &[]).await
+}
+
+/// Fetch configuration while explicitly declaring the supervisor implementation's
+/// enforcement support. This only gates delivery; installation still needs evidence.
+pub async fn fetch_settings_snapshot_with_capabilities(
+    endpoint: &str,
+    sandbox_name: &str,
+    capabilities: &[String],
+) -> Result<SettingsPollResult> {
+    let mut client = connect(endpoint).await?;
+    fetch_settings_snapshot_with_client(&mut client, sandbox_name, None, capabilities).await
 }
 
 async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
     workspace: Option<&str>,
+    supported_enforcement_capabilities: &[String],
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             workspace_scope: workspace.map(crate::proto::workspace_selector),
             name: sandbox_name.to_string(),
+            supported_enforcement_capabilities: supported_enforcement_capabilities.to_vec(),
         })
         .await
         .map_err(grpc_status_error)?;
@@ -935,7 +951,7 @@ async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_name: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_name, None).await?;
+    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_name, None, &[]).await?;
 
     // version 0 with no policy means the sandbox was created without one.
     if snapshot.version == 0 && snapshot.policy.is_none() {
@@ -990,7 +1006,7 @@ pub async fn discover_and_sync_policy(
     sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace))
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace), &[])
         .await?
         .policy
         .ok_or_else(|| {
@@ -1022,7 +1038,20 @@ pub async fn sync_policy_and_fetch_snapshot(
 ) -> Result<SettingsPollResult> {
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace), &[]).await
+}
+
+/// Sync and fetch with explicit supervisor enforcement support.
+pub async fn sync_policy_and_fetch_snapshot_with_capabilities(
+    endpoint: &str,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+    workspace: &str,
+    capabilities: &[String],
+) -> Result<SettingsPollResult> {
+    let mut client = connect(endpoint).await?;
+    sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace), capabilities).await
 }
 
 /// Report an exact runtime configuration generation. Pending registration uses
@@ -1034,6 +1063,28 @@ pub async fn report_sandbox_configuration(
     snapshot: Option<&SettingsPollResult>,
     state: crate::proto::ConfigurationAdmissionState,
     error: &str,
+) -> Result<()> {
+    report_sandbox_configuration_with_enforcement(
+        endpoint,
+        sandbox_id,
+        instance_id,
+        snapshot,
+        state,
+        error,
+        None,
+    )
+    .await
+}
+
+/// Report runtime-produced evidence along with the existing fenced admission.
+pub async fn report_sandbox_configuration_with_enforcement(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&SettingsPollResult>,
+    state: crate::proto::ConfigurationAdmissionState,
+    error: &str,
+    loaded_enforcement: Option<crate::proto::LoadedEnforcementEvidence>,
 ) -> Result<()> {
     let mut client = connect(endpoint).await?;
     client
@@ -1052,6 +1103,7 @@ pub async fn report_sandbox_configuration(
                 provider_env_revision: snapshot
                     .map_or(0, |snapshot| snapshot.provider_env_revision),
                 error: error.to_string(),
+                loaded_enforcement,
             }),
         })
         .await
@@ -1245,6 +1297,8 @@ fn provider_subject_token_exchange_status(status: Status) -> miette::Report {
 /// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
+    supported_enforcement_capabilities: Vec<String>,
+    configuration_instance_id: String,
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares
@@ -1336,6 +1390,21 @@ mod settings_poll_tests {
     }
 
     #[test]
+    fn withheld_unsupported_configuration_defaults_to_fail_closed() {
+        let result = settings_poll_result(GetSandboxConfigResponse {
+            configuration_error: "Supervisor lacks required enforcement support".into(),
+            configuration_instance_id: "current-instance".into(),
+            ..Default::default()
+        });
+        assert!(!result.configuration_admitted);
+        assert!(result.policy.is_none());
+        assert_eq!(
+            result.policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
+        );
+    }
+
+    #[test]
     fn extension_authentication_capability_round_trips_and_defaults_disabled() {
         let enabled = settings_poll_result(GetSandboxConfigResponse {
             extension_authentication_enabled: true,
@@ -1402,10 +1471,19 @@ impl CachedOpenShellClient {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
         Ok(Self {
+            supported_enforcement_capabilities: Vec::new(),
+            configuration_instance_id: String::new(),
             client,
             workspace: Arc::new(tokio::sync::OnceCell::new()),
             extension_credentials,
         })
+    }
+
+    /// Explicitly declare capabilities implemented by this supervisor build.
+    #[must_use]
+    pub fn with_enforcement_capabilities(mut self, capabilities: Vec<String>) -> Self {
+        self.supported_enforcement_capabilities = capabilities;
+        self
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.
@@ -1425,6 +1503,7 @@ impl CachedOpenShellClient {
             .get_sandbox_config(GetSandboxConfigRequest {
                 workspace_scope,
                 name: sandbox_name.to_string(),
+                supported_enforcement_capabilities: self.supported_enforcement_capabilities.clone(),
             })
             .await
             .into_diagnostic()?;
@@ -1432,6 +1511,14 @@ impl CachedOpenShellClient {
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
         Ok(result)
+    }
+
+    /// Set the UUID this supervisor itself registered. Never infer a caller's
+    /// identity from whichever registration a later configuration poll returns.
+    #[must_use]
+    pub fn with_configuration_instance(mut self, instance_id: String) -> Self {
+        self.configuration_instance_id = instance_id;
+        self
     }
 
     /// The credential store backing this connection's extension clients.
@@ -1472,6 +1559,7 @@ impl CachedOpenShellClient {
             &mut client,
             &self.extension_credentials,
             services,
+            &self.configuration_instance_id,
         )
         .await
     }

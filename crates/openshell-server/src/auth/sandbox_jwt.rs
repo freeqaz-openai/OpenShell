@@ -352,8 +352,9 @@ impl ExtensionJwtIssuer {
             caller_kind,
             sandbox_id,
             ttl,
-            now_secs(),
-            uuid::Uuid::new_v4(),
+            (now_secs(), uuid::Uuid::new_v4()),
+            None,
+            None,
         )
     }
 
@@ -364,9 +365,11 @@ impl ExtensionJwtIssuer {
         caller_kind: ExtensionCallerKind,
         sandbox_id: Option<&str>,
         ttl: Duration,
-        issued_at: i64,
-        token_id: uuid::Uuid,
+        token_metadata: (i64, uuid::Uuid),
+        instance_id: Option<&str>,
+        exchange_key: Option<&[u8]>,
     ) -> Result<MintedToken, Status> {
+        let (issued_at, token_id) = token_metadata;
         if audience.as_str() == self.gateway_audience {
             return Err(Status::invalid_argument(
                 "extension audience must not equal the gateway sandbox audience",
@@ -396,6 +399,14 @@ impl ExtensionJwtIssuer {
             }
         };
 
+        if instance_id.is_some_and(|instance| {
+            caller_kind != ExtensionCallerKind::Supervisor
+                || uuid::Uuid::parse_str(instance).is_err()
+        }) {
+            return Err(Status::invalid_argument(
+                "invalid supervisor configuration instance",
+            ));
+        }
         let exp = issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
         let claims = ExtensionJwtClaims {
             iss: self.issuer.clone(),
@@ -406,6 +417,15 @@ impl ExtensionJwtIssuer {
             jti: token_id.to_string(),
             caller_kind,
             sandbox_id,
+            instance_id: instance_id.map(str::to_string),
+            exchange_key: exchange_key
+                .filter(|key| key.len() == 32 && instance_id.is_some())
+                .map(|key| openshell_extension_core::ExchangeKey {
+                    profile: "openshell-exchange-v1".to_string(),
+                    kty: "OKP".to_string(),
+                    crv: "Ed25519".to_string(),
+                    x: URL_SAFE_NO_PAD.encode(key),
+                }),
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
@@ -546,6 +566,7 @@ mod tests {
         assert_eq!(claims.sub, "openshell-gateway:gateway-a");
         assert_eq!(claims.caller_kind, ExtensionCallerKind::Gateway);
         assert_eq!(claims.sandbox_id, None);
+        assert_eq!(claims.instance_id, None);
         assert!(!claims.jti.is_empty());
         assert_eq!(gateway.expires_at_ms, claims.exp * 1000);
 
@@ -561,6 +582,7 @@ mod tests {
             .expect("valid supervisor extension token")
             .claims;
         assert_eq!(claims.sub, "spiffe://openshell/sandbox/sandbox-a");
+        assert_eq!(claims.instance_id, None);
         assert_eq!(claims.caller_kind, ExtensionCallerKind::Supervisor);
         assert_eq!(claims.sandbox_id.as_deref(), Some("sandbox-a"));
     }

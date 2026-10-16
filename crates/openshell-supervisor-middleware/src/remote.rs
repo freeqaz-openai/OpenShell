@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::middleware::InstallationReplyStream;
 use openshell_core::middleware::{
     HttpRequestView, HttpResponseResultStream, SupervisorMiddlewareEndpoint,
     WebSocketResponseStream,
 };
+use openshell_core::proto::InstallationExchangeRequest;
+use openshell_core::proto::middleware::v1::http_installation_exchange_client::HttpInstallationExchangeClient;
 use openshell_core::proto::middleware::v1::http_response_pre_return_client::HttpResponsePreReturnClient;
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
@@ -30,9 +33,17 @@ type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
 #[derive(Clone)]
 pub struct GrpcMiddlewareService {
     service: Arc<dyn SupervisorMiddlewareEndpoint>,
+    pub(crate) installation_key: Option<openshell_extension_core::InstallationSigningKey>,
 }
 
 impl GrpcMiddlewareService {
+    pub(crate) async fn open_installation_exchange(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<InstallationExchangeRequest>,
+    ) -> Result<InstallationReplyStream, Status> {
+        self.service.open_installation_exchange(requests).await
+    }
+
     /// Connect an operator registration and wrap its generated gRPC client.
     pub async fn connect(
         registration_name: &str,
@@ -41,6 +52,10 @@ impl GrpcMiddlewareService {
         bearer: Option<BearerTokenSlot>,
     ) -> Result<Self> {
         Ok(Self {
+            installation_key: bearer
+                .as_ref()
+                .and_then(|slot| slot.installation_key())
+                .cloned(),
             service: Arc::new(
                 RemoteMiddlewareService::connect(
                     registration_name,
@@ -56,7 +71,10 @@ impl GrpcMiddlewareService {
     /// Wrap a protobuf-shaped service used by transport-boundary tests.
     #[cfg(test)]
     pub fn from_service(service: Arc<dyn SupervisorMiddlewareEndpoint>) -> Self {
-        Self { service }
+        Self {
+            service,
+            installation_key: None,
+        }
     }
 
     /// Forward a manifest request through the protobuf service contract.
@@ -121,6 +139,7 @@ impl GrpcMiddlewareService {
 
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
+    installation_client: HttpInstallationExchangeClient<ExtensionChannel>,
     client: SupervisorMiddlewareClient<ExtensionChannel>,
     response_client: HttpResponsePreReturnClient<ExtensionChannel>,
 }
@@ -150,6 +169,9 @@ impl RemoteMiddlewareService {
         let channel = InterceptedService::new(channel, interceptor);
 
         Ok(Self {
+            installation_client: HttpInstallationExchangeClient::new(channel.clone())
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
             client: SupervisorMiddlewareClient::new(channel.clone())
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
@@ -162,6 +184,21 @@ impl RemoteMiddlewareService {
 
 #[tonic::async_trait]
 impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
+    async fn open_installation_exchange(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<InstallationExchangeRequest>,
+    ) -> Result<InstallationReplyStream, Status> {
+        let replies = self
+            .installation_client
+            .clone()
+            .exchange(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                requests,
+            )))
+            .await?
+            .into_inner();
+        Ok(Box::pin(replies))
+    }
+
     async fn describe(
         &self,
         request: Request<MiddlewareDescribeRequest>,

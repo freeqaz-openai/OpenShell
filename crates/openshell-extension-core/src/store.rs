@@ -32,12 +32,40 @@ struct Entry {
 #[derive(Clone, Default)]
 pub struct ExtensionCredentialStore {
     inner: Arc<RwLock<HashMap<String, Entry>>>,
+    installation: Option<(String, crate::InstallationSigningKey)>,
 }
 
 impl ExtensionCredentialStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh supervisor process, not a bearer or an identifier recovered from disk.
+    pub fn new_installation() -> Result<Self, aws_lc_rs::error::Unspecified> {
+        Ok(Self {
+            installation: Some((
+                uuid::Uuid::new_v4().to_string(),
+                crate::InstallationSigningKey::generate()?,
+            )),
+            ..Self::default()
+        })
+    }
+
+    /// The exact configuration instance and possession also sent on the authenticated hello.
+    #[must_use]
+    pub fn installation(&self) -> Option<(&str, &crate::InstallationSigningKey)> {
+        self.installation
+            .as_ref()
+            .map(|(instance, key)| (instance.as_str(), key))
+    }
+
+    /// The startup Describe token predates enrollment. Have the existing, single refresh
+    /// owner replace it promptly after `SessionAccepted`, without racing the gateway ratchet.
+    pub fn session_enrolled(&self) {
+        for entry in self.write().values_mut() {
+            entry.refresh_after_ms = 0;
+        }
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Entry>> {
@@ -70,7 +98,8 @@ impl ExtensionCredentialStore {
             entry.refresh_after_ms = refresh_after_ms;
             return Ok(entry.slot.clone());
         }
-        let slot = BearerTokenSlot::new(token, expires_at_ms)?;
+        let mut slot = BearerTokenSlot::new(token, expires_at_ms)?;
+        slot.installation_key = self.installation().map(|(_, key)| key.clone());
         slots.insert(
             name.to_string(),
             Entry {
@@ -197,6 +226,32 @@ mod tests {
     /// exercise a live slot need an expiry in the actual future rather than
     /// the synthetic `NOW` used for deterministic scheduling arithmetic.
     const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
+
+    #[test]
+    fn enrollment_replaces_pre_enrollment_token_using_existing_single_refresh_owner() {
+        let store = ExtensionCredentialStore::new_installation().unwrap();
+        let slot = store
+            .install("authority", "before-enrollment", 100_000, 1)
+            .unwrap();
+        assert_eq!(
+            slot.installation_key().unwrap().public_key(),
+            store.installation().unwrap().1.public_key()
+        );
+        let names = vec!["authority".to_string()];
+        assert!(!store.needs_refresh(&names, 2));
+        store.session_enrolled();
+        assert!(store.needs_refresh(&names, 3));
+        store
+            .install("authority", "with-enrollment", 100_004, 4)
+            .unwrap();
+        assert!(!store.needs_refresh(&names, 5));
+        assert!(
+            BearerTokenSlot::new("copied-only", 100_000)
+                .unwrap()
+                .installation_key()
+                .is_none()
+        );
+    }
 
     #[test]
     fn rotation_updates_existing_slots_in_place() {

@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
@@ -47,6 +48,7 @@ serde_json = { workspace = true }
 serde_yml = { workspace = true }
 sha1 = "0.10"
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 spiffe = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
@@ -54,7 +56,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 webpki-roots = { workspace = true, optional = true }
 
 [features]
@@ -62,6 +64,9 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+aws-lc-rs = { workspace = true }
+prost = { workspace = true }
+jsonwebtoken = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tonic = { workspace = true }

@@ -61,6 +61,16 @@ pub fn into_proto(
             Ok((
                 key.clone(),
                 NetworkMiddlewareConfig {
+                    credential_authority: definition.credential_authority,
+                    execution_authority: definition.execution_authority,
+                    credential_connectors: definition
+                        .credential_connectors
+                        .into_iter()
+                        .map(|pin| openshell_core::proto::CredentialConnector {
+                            path: pin.path,
+                            sha256: pin.sha256,
+                        })
+                        .collect(),
                     name: if definition.name.is_empty() {
                         key
                     } else {
@@ -93,6 +103,16 @@ pub fn from_proto(
             (
                 name.clone(),
                 NetworkMiddlewareConfigDef {
+                    credential_authority: middleware.credential_authority,
+                    execution_authority: middleware.execution_authority,
+                    credential_connectors: middleware
+                        .credential_connectors
+                        .iter()
+                        .map(|pin| openshell_policy_schema::CredentialConnector {
+                            path: pin.path.clone(),
+                            sha256: pin.sha256.clone(),
+                        })
+                        .collect(),
                     name: middleware.name.clone(),
                     middleware: middleware.middleware.clone(),
                     order: middleware.order,
@@ -191,6 +211,31 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
     let mut middlewares: Vec<_> = policy.network_middlewares.iter().collect();
     middlewares.sort_by_key(|(name, _)| name.as_str());
     for (name, middleware) in middlewares {
+        if middleware.credential_authority
+            && ((middleware.credential_connectors.is_empty() != middleware.execution_authority)
+                || middleware.credential_connectors.len() > 64
+                || middleware.credential_connectors.iter().any(|pin| {
+                    !openshell_core::middleware::valid_credential_connector(&pin.path, &pin.sha256)
+                })
+                || middleware.endpoints.as_ref().is_none_or(|selector| {
+                    selector.include.len() != 1
+                        || !selector.exclude.is_empty()
+                        || selector.include[0].contains(['*', '?', '[', ']'])
+                }))
+            || (!middleware.credential_authority
+                && (middleware.execution_authority || !middleware.credential_connectors.is_empty()))
+        {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: name.clone(),
+                reason: "credential authority requires one literal host, no exclusions, and either explicit execution authority or bounded exact connector pins".to_string(),
+            });
+        }
+        if middleware.credential_authority && middleware.on_error == "fail_open" {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: name.clone(),
+                reason: "credential_authority requires fail_closed".to_string(),
+            });
+        }
         if name.is_empty() {
             violations.push(PolicyViolation::InvalidMiddlewareConfig {
                 name: name.clone(),

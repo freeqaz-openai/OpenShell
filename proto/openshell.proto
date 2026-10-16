@@ -843,6 +843,11 @@ message RefreshSandboxTokenRequest {
   // Operator registration names for extension services selected by the
   // sandbox's effective policy.
   repeated string extension_service_names = 1;
+  // The supervisor's own successfully registered configuration instance UUID.
+  // Required for protected extension credentials; checked against the current
+  // authenticated sandbox registration before minting a signed instance_id claim.
+  // Empty preserves legacy non-protected/background refresh behavior.
+  string configuration_instance_id = 2;
 }
 
 // RefreshSandboxToken response. The new token replaces the supervisor's
@@ -2815,6 +2820,29 @@ message GetSandboxPolicyStatusResponse {
   SandboxPolicyRevision revision = 1;
   // The currently active (loaded) policy version for this sandbox.
   uint32 active_version = 2;
+  // Present only for the current authenticated supervisor registration and exact
+  // effective configuration. LOADED alone never establishes capability support.
+  // Requires identical source and effective policies and hashes.
+  LoadedEnforcementEvidence loaded_enforcement = 3;
+  // Current installation observation for identity composition or exactly one
+  // proven inert rule contributed by the sandbox's sole attached provider.
+  LoadedPolicyObservationV1 loaded_policy_observation = 4;
+}
+
+// Observation from a trusted registered supervisor, not attestation or a grant
+// to send traffic. Unknown policy derivations yield no observation.
+message LoadedPolicyObservationV1 {
+  // Canonical hash of the full queried source revision policy.
+  string source_policy_hash = 1;
+  openshell.sandbox.v1.SandboxPolicy effective_policy = 2;
+  // policy_hash identifies effective_policy, not the source revision.
+  LoadedEnforcementEvidence enforcement = 3;
+  // Empty for identity composition. Otherwise the exact provider-derived map
+  // key of the sole extra rule: name equals that key, every other typed field
+  // is default, and removing it yields the full source policy exactly.
+  string inert_provider_rule = 4;
+  // From the gateway-owned current supervisor session, not the policy-status caller.
+  bytes registered_exchange_public_key = 5;
 }
 
 // List sandbox policies request.
@@ -2871,6 +2899,23 @@ message SandboxConfigurationAdmission {
   uint64 config_revision = 5;
   uint64 provider_env_revision = 6;
   string error = 7;
+  // Supervisor-produced evidence, emitted only after actual runtime installation.
+  // Absent on older supervisors and on pending/rejected configurations.
+  LoadedEnforcementEvidence loaded_enforcement = 8;
+}
+
+// Positive runtime enforcement evidence, bound to the existing configuration
+// registration fence. This is an installation observation, not an authorization
+// lease or a provider-effect receipt. Consumers must query current evidence.
+message LoadedEnforcementEvidence {
+  string sandbox_id = 1;
+  string instance_id = 2;
+  uint32 policy_version = 3;
+  string policy_hash = 4;
+  // Includes the installed operator middleware registry configuration.
+  uint64 config_revision = 5;
+  uint64 provider_env_revision = 6;
+  repeated string enforced_capabilities = 7;
 }
 
 message ReportSandboxConfigurationRequest {
@@ -3001,6 +3046,9 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Installation-specific Ed25519 public key (32 raw bytes). Enrolled only
+  // through this authenticated current supervisor session, never an exchange.
+  bytes exchange_public_key = 5;
 }
 
 // Gateway accepts the supervisor session.

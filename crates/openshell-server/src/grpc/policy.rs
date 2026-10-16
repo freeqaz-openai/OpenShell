@@ -52,12 +52,12 @@ use openshell_core::proto::{
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
     L7RuleTarget as ProtoL7RuleTarget, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus, ProviderReadinessReason,
-    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse,
+    LoadedPolicyObservationV1, PolicyChunk, PolicyMergeOperation, PolicySource, PolicyStatus,
+    ProviderReadinessReason, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
+    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -2588,7 +2588,43 @@ async fn handle_get_sandbox_config_inner(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+    let config = load_sandbox_config(state, &sandbox).await?;
+    if matches!(principal, Principal::Sandbox(_))
+        && config.policy.as_ref().is_some_and(|policy| {
+            policy
+                .network_middlewares
+                .values()
+                .filter(|e| e.credential_authority)
+                .any(|entry| {
+                    openshell_core::extension_protocol::credential_enforcement_profile(
+                        entry.execution_authority,
+                    )
+                    .iter()
+                    .any(|cap| {
+                        !req.supported_enforcement_capabilities
+                            .iter()
+                            .any(|v| v == cap)
+                    })
+                })
+        })
+    {
+        // Preserve the observation tuple so an older supervisor can report its
+        // rejection under the existing registration fence and wait for repair.
+        // Never give its parser protected policy or cached-registry inputs.
+        return Ok(Response::new(GetSandboxConfigResponse {
+            configuration_admitted: false,
+            configuration_error: "Supervisor lacks required enforcement support; upgrade the supervisor before activating this policy".into(),
+            configuration_instance_id: config.configuration_instance_id,
+            version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            policy_validation_failure_mode: "fail_closed".into(),
+            workspace: config.workspace,
+            ..Default::default()
+        }));
+    }
+    Ok(Response::new(config))
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -4209,6 +4245,9 @@ pub(super) async fn handle_get_sandbox_policy_status(
     request: Request<GetSandboxPolicyStatusRequest>,
 ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
     let principal = super::extract_principal(&request)?;
+    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire policy evidence lock")
+    })?;
     let req = request.into_inner();
     let sandbox = if req.global {
         if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
@@ -4264,10 +4303,113 @@ pub(super) async fn handle_get_sandbox_policy_status(
     };
     let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
+    let revision = policy_record_to_revision(&record, true)?;
+    let mut loaded_enforcement = None;
+    let mut loaded_policy_observation = None;
+    if let Some(sandbox) = &sandbox
+        && enforcement_runtime_active(sandbox)
+        && revision.status == i32::from(PolicyStatus::Loaded)
+        && active_version == revision.version
+        && let Some(admission) = sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+        && admission.state
+            == i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        && admission.error.is_empty()
+        && admission.loaded_enforcement.is_some()
+    {
+        // A broken/revoked configuration returns no evidence, even if durable
+        // historical admission and LOADED status still exist.
+        if let Ok(config) = load_sandbox_config(state, sandbox).await
+            && config.configuration_admitted
+            && configuration_generation_matches(admission, &config)
+            && validate_loaded_enforcement(sandbox.object_id(), admission, &config).is_ok()
+        {
+            // Preserve field 3's original predicates, including identical-hash
+            // global overrides. V1 independently requires a sandbox source.
+            if (admission.policy_version, &admission.policy_hash)
+                == (revision.version, &revision.policy_hash)
+            {
+                loaded_enforcement.clone_from(&admission.loaded_enforcement);
+            }
+            loaded_policy_observation =
+                loaded_policy_observation_v1(sandbox, &revision, admission, &config);
+            if let Some(observation) = &mut loaded_policy_observation {
+                if let Some(session) = state.supervisor_sessions.provider_readiness(&policy_id)? {
+                    observation.registered_exchange_public_key = session
+                        .exchange_key(&admission.instance_id)
+                        .unwrap_or_default()
+                        .to_vec();
+                }
+            }
+        }
+    }
     Ok(Response::new(GetSandboxPolicyStatusResponse {
-        revision: Some(policy_record_to_revision(&record, true)?),
+        revision: Some(revision),
         active_version,
+        loaded_enforcement,
+        loaded_policy_observation,
     }))
+}
+
+/// Called under the authenticated policy-status lock after checking the active
+/// loaded source revision and the registered supervisor's accepted admission.
+fn loaded_policy_observation_v1(
+    sandbox: &Sandbox,
+    revision: &SandboxPolicyRevision,
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    config: &GetSandboxConfigResponse,
+) -> Option<LoadedPolicyObservationV1> {
+    if config.policy_source != i32::from(PolicySource::Sandbox)
+        || !config.configuration_admitted
+        || admission.policy_version != revision.version
+        || !configuration_generation_matches(admission, config)
+        || validate_loaded_enforcement(sandbox.object_id(), admission, config).is_err()
+    {
+        return None;
+    }
+    let source = revision.policy.as_ref()?;
+    let effective = config.policy.as_ref()?;
+    let enforcement = admission.loaded_enforcement.as_ref()?;
+    let source_policy_hash = deterministic_policy_hash(source);
+    if source_policy_hash != revision.policy_hash
+        || enforcement.policy_hash != deterministic_policy_hash(effective)
+    {
+        return None;
+    }
+
+    let inert_provider_rule = if source == effective {
+        String::new()
+    } else {
+        let [provider] = sandbox.spec.as_ref()?.providers.as_slice() else {
+            return None;
+        };
+        let rule_name = openshell_policy::provider_rule_name(provider);
+        if source.network_policies.contains_key(&rule_name) {
+            return None;
+        }
+        let mut stripped = effective.clone();
+        let rule = stripped.network_policies.remove(&rule_name)?;
+        if rule
+            != (NetworkPolicyRule {
+                name: rule_name.clone(),
+                ..Default::default()
+            })
+            || &stripped != source
+        {
+            return None;
+        }
+        rule_name
+    };
+    Some(LoadedPolicyObservationV1 {
+        source_policy_hash,
+        effective_policy: Some(effective.clone()),
+        enforcement: Some(enforcement.clone()),
+        inert_provider_rule,
+        // The policy helper alone has no authority to identify the current session key.
+        registered_exchange_public_key: Vec::new(),
+    })
 }
 
 pub(super) async fn handle_list_sandbox_policies(
@@ -4384,13 +4526,79 @@ fn configuration_generation_matches(
     )
 }
 
+fn validate_loaded_enforcement(
+    sandbox_id: &str,
+    admission: &openshell_core::proto::SandboxConfigurationAdmission,
+    config: &GetSandboxConfigResponse,
+) -> Result<(), Status> {
+    let protects_credentials = config.policy.as_ref().is_some_and(|policy| {
+        policy
+            .network_middlewares
+            .values()
+            .any(|entry| entry.credential_authority)
+    });
+    let Some(evidence) = &admission.loaded_enforcement else {
+        return if protects_credentials {
+            Err(Status::failed_precondition(
+                "effective policy requires supervisor enforcement evidence",
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    if evidence.sandbox_id != sandbox_id
+        || evidence.instance_id != admission.instance_id
+        || evidence.policy_version != admission.policy_version
+        || evidence.policy_hash != admission.policy_hash
+        || evidence.config_revision != admission.config_revision
+        || evidence.provider_env_revision != admission.provider_env_revision
+        || !configuration_generation_matches(admission, config)
+    {
+        return Err(Status::aborted(
+            "loaded enforcement generation does not match current configuration",
+        ));
+    }
+    let entries = config
+        .policy
+        .as_ref()
+        .into_iter()
+        .flat_map(|p| p.network_middlewares.values())
+        .filter(|e| e.credential_authority);
+    if (protects_credentials
+        && entries.into_iter().any(|entry| {
+            evidence.enforced_capabilities
+                != openshell_core::extension_protocol::credential_enforcement_profile(
+                    entry.execution_authority,
+                )
+        }))
+        || (!protects_credentials && !evidence.enforced_capabilities.is_empty())
+    {
+        return Err(Status::failed_precondition(
+            "loaded enforcement capabilities do not match effective policy",
+        ));
+    }
+    Ok(())
+}
+
+fn enforcement_runtime_active(sandbox: &Sandbox) -> bool {
+    matches!(
+        openshell_core::proto::SandboxPhase::try_from(sandbox.phase()),
+        Ok(openshell_core::proto::SandboxPhase::Ready
+            | openshell_core::proto::SandboxPhase::Provisioning
+            | openshell_core::proto::SandboxPhase::Starting)
+    ) && sandbox
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.deletion_time.is_none())
+}
+
 pub(super) async fn handle_report_sandbox_configuration(
     state: &Arc<ServerState>,
     request: Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
 ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
     use openshell_core::proto::ConfigurationAdmissionState;
     let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let mut admission = request
         .get_ref()
         .admission
@@ -4404,6 +4612,14 @@ pub(super) async fn handle_report_sandbox_configuration(
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
     }
+    if admission.loaded_enforcement.is_some() {
+        crate::auth::guard::ensure_sandbox_principal_scope(&principal, &sandbox_id)?;
+        if reported != ConfigurationAdmissionState::Accepted {
+            return Err(Status::invalid_argument(
+                "loaded enforcement requires accepted configuration",
+            ));
+        }
+    }
     let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
         super::persistence_error_to_status(error, "acquire configuration admission lock")
     })?;
@@ -4413,8 +4629,9 @@ pub(super) async fn handle_report_sandbox_configuration(
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let sandbox_name = sandbox.object_name().to_string();
-    let workspace = sandbox.object_workspace().to_string();
+    if admission.loaded_enforcement.is_some() && !enforcement_runtime_active(&sandbox) {
+        return Err(Status::failed_precondition("sandbox runtime is not active"));
+    }
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
@@ -4448,34 +4665,23 @@ pub(super) async fn handle_report_sandbox_configuration(
         ));
     }
     if reported == ConfigurationAdmissionState::Accepted {
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            name: sandbox_name.clone(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        let config = handle_get_sandbox_config(state, config_request)
-            .await?
-            .into_inner();
+        let config = load_sandbox_config(state, &sandbox).await?;
         if !config.configuration_admitted || !configuration_generation_matches(&admission, &config)
         {
             return Err(Status::aborted(
                 "configuration changed or is not admitted; fetch and validate again",
             ));
         }
+        validate_loaded_enforcement(&sandbox_id, &admission, &config)?;
         admission.error.clear();
     } else if reported == ConfigurationAdmissionState::Rejected {
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
-            name: sandbox_name,
-        });
-        *config_request.extensions_mut() = request.extensions().clone();
-        admission.error = match handle_get_sandbox_config(state, config_request).await {
-            Ok(config) if !configuration_generation_matches(&admission, config.get_ref()) => {
+        admission.error = match load_sandbox_config(state, &sandbox).await {
+            Ok(config) if !configuration_generation_matches(&admission, &config) => {
                 return Err(Status::aborted("rejected configuration generation has changed"));
             }
-            Ok(config) if !config.get_ref().configuration_error.is_empty() => config.into_inner().configuration_error,
+            Ok(config) if !config.configuration_error.is_empty() => config.configuration_error,
             _ => "Effective configuration could not be activated; replace the policy or repair attached providers".to_string(),
         };
         if let Some(current) = current
@@ -4493,6 +4699,9 @@ pub(super) async fn handle_report_sandbox_configuration(
         {
             admission = current.clone();
         }
+    }
+    if reported != ConfigurationAdmissionState::Accepted {
+        admission.loaded_enforcement = None;
     }
     let expected_version = sandbox
         .metadata
@@ -4584,6 +4793,10 @@ pub(super) async fn handle_report_policy_status(
         None
     };
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire policy mutation lock")
+    })?;
+
     let updated = state
         .store
         .update_policy_status(
@@ -4606,9 +4819,6 @@ pub(super) async fn handle_report_policy_status(
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
 
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-            super::persistence_error_to_status(error, "acquire policy mutation lock")
-        })?;
         let sandbox = state
             .store
             .get_message::<Sandbox>(&req.sandbox_id)
@@ -4630,6 +4840,14 @@ pub(super) async fn handle_report_policy_status(
                 expected_resource_version,
                 |sandbox| {
                     sandbox.set_current_policy_version(version_to_set);
+                    if let Some(admission) = sandbox
+                        .status
+                        .as_mut()
+                        .and_then(|status| status.configuration_admission.as_mut())
+                        && admission.policy_version != version_to_set
+                    {
+                        admission.loaded_enforcement = None;
+                    }
                     if let Some(endpoints) = &endpoint_reset {
                         endpoint_status::reconcile_endpoint_statuses(
                             sandbox,
@@ -4643,6 +4861,35 @@ pub(super) async fn handle_report_policy_status(
             .await
             .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
 
+        state.sandbox_index.update_from_sandbox(&updated);
+        state.sandbox_watch_bus.notify(&req.sandbox_id);
+    } else if let Some(sandbox) = state
+        .store
+        .get_message::<Sandbox>(&req.sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    {
+        // A failed load cannot leave a prior positive capability observation
+        // usable. LKG may still run, but qualification requires a new receipt.
+        let updated = state
+            .store
+            .update_message_cas::<Sandbox, _>(
+                &req.sandbox_id,
+                sandbox.get_resource_version(),
+                |sandbox| {
+                    if let Some(admission) = sandbox
+                        .status
+                        .as_mut()
+                        .and_then(|status| status.configuration_admission.as_mut())
+                    {
+                        admission.loaded_enforcement = None;
+                    }
+                },
+            )
+            .await
+            .map_err(|error| {
+                super::persistence_error_to_status(error, "invalidate loaded enforcement")
+            })?;
         state.sandbox_index.update_from_sandbox(&updated);
         state.sandbox_watch_bus.notify(&req.sandbox_id);
     }
@@ -7806,6 +8053,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -7822,6 +8070,7 @@ mod tests {
             config_revision: config.config_revision,
             provider_env_revision: config.provider_env_revision,
             error: String::new(),
+            loaded_enforcement: None,
         };
         let mut outdated_admission = accepted.clone();
         outdated_admission.provider_env_revision =
@@ -7993,6 +8242,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -8025,6 +8275,7 @@ mod tests {
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -8276,6 +8527,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        supported_enforcement_capabilities: Vec::new(),
                     }),
                     &sandbox_id,
                 ),
@@ -8324,6 +8576,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -8379,6 +8632,7 @@ mod tests {
                     Request::new(GetSandboxConfigRequest {
                         name: sandbox_id.clone(),
                         workspace_scope: None,
+                        supported_enforcement_capabilities: Vec::new(),
                     }),
                     &sandbox_id,
                 ),
@@ -8526,6 +8780,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -8637,6 +8892,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -8694,6 +8950,7 @@ mod tests {
                 Request::new(GetSandboxConfigRequest {
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
+                    supported_enforcement_capabilities: Vec::new(),
                 }),
                 sandbox_id,
             ),
@@ -10543,6 +10800,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "sb-b".to_string(),
                 workspace_scope: None,
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-a",
         );
@@ -10559,6 +10817,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "missing-sandbox".to_string(),
                 workspace_scope: None,
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-a",
         );
@@ -10597,6 +10856,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: None,
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-self",
         );
@@ -10612,6 +10872,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "self".to_string(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-self",
         );
@@ -10794,6 +11055,7 @@ mod tests {
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
             )),
+            supported_enforcement_capabilities: Vec::new(),
         }));
         handle_get_sandbox_config(&state, req)
             .await
@@ -11023,6 +11285,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -11140,6 +11403,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -11165,6 +11429,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -11770,6 +12035,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -12485,6 +12751,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -13130,6 +13397,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -13195,6 +13463,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -13255,6 +13524,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -14377,6 +14647,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             })),
         )
         .await
@@ -21046,6 +21317,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-alpha",
         );
@@ -21059,6 +21331,7 @@ mod tests {
             Request::new(GetSandboxConfigRequest {
                 name: "work".to_string(),
                 workspace_scope: None,
+                supported_enforcement_capabilities: Vec::new(),
             }),
             "sb-beta",
         );
@@ -22799,6 +23072,7 @@ mod tests {
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),
                 )),
+                supported_enforcement_capabilities: Vec::new(),
             }),
         )
         .await
@@ -22853,3 +23127,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "policy_loaded_enforcement_tests.rs"]
+mod loaded_enforcement_tests;

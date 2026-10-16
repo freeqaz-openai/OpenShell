@@ -5,6 +5,10 @@
 
 #![allow(clippy::result_large_err)] // The RPC boundary returns tonic status values.
 
+#[path = "exchange_key.rs"]
+mod exchange_key;
+use exchange_key::EnrolledExchangeKey;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,6 +37,7 @@ const OBSERVATION_TTL_SECONDS: u32 = 15;
 #[derive(Clone, Debug)]
 pub struct ProviderReadinessEvidence {
     network_instance_id: String,
+    exchange_public_key: Option<EnrolledExchangeKey>,
     supported: bool,
     process_instance_id: Option<String>,
     last_seen: Instant,
@@ -49,11 +54,15 @@ impl ProviderReadinessEvidence {
 
     /// Capture capability and instance identity from the authenticated hello.
     pub(crate) fn from_hello(hello: &SupervisorHello) -> Result<Self, Status> {
-        if hello.supports_provider_readiness {
+        if hello.supports_provider_readiness || !hello.exchange_public_key.is_empty() {
             canonical_uuid(&hello.sandbox_id)?;
             canonical_uuid(&hello.instance_id)?;
         }
+        let exchange_public_key =
+            EnrolledExchangeKey::capture(&hello.instance_id, &hello.exchange_public_key)
+                .map_err(Status::invalid_argument)?;
         Ok(Self {
+            exchange_public_key,
             network_instance_id: hello.instance_id.clone(),
             supported: hello.supports_provider_readiness,
             process_instance_id: None,
@@ -61,6 +70,10 @@ impl ProviderReadinessEvidence {
             observation: None,
             observed_time: None,
         })
+    }
+
+    pub(crate) fn exchange_key(&self, instance: &str) -> Option<&[u8]> {
+        self.exchange_public_key.as_ref()?.for_instance(instance)
     }
 
     /// Accept an ordered report after the registry verifies session ownership.

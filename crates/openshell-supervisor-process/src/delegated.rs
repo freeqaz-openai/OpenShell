@@ -87,8 +87,12 @@ pub async fn start_boundary_access(
     port_forward: Arc<dyn BoundaryLoopbackConnector>,
     agent: Arc<dyn BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
+    extension_credentials: openshell_extension_core::ExtensionCredentialStore,
 ) -> Result<BoundaryAccess> {
-    let instance_id = uuid::Uuid::new_v4().to_string();
+    let instance_id = extension_credentials.installation().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |(instance, _)| instance.to_string(),
+    );
     let terminating = Arc::new(AtomicBool::new(false));
     let Some(ssh_socket_path) = ssh_socket_path.map(std::path::PathBuf::from) else {
         return Ok(BoundaryAccess {
@@ -166,6 +170,7 @@ pub async fn start_boundary_access(
                 crate::supervisor_session::SessionRuntimeContext {
                     instance_id: instance_id.clone(),
                     session_id_updates: supervisor_session_updates,
+                    extension_credentials,
                 },
             );
             // Session establishment retries through gateway restarts. The

@@ -17,6 +17,39 @@ use crate::proto::{
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
+/// A protected operation's immutable `UUIDv7` creation horizon. Consumers retain
+/// replay reservations through this horizon, never merely a caller's deadline.
+pub const MAX_HTTP_CREDENTIAL_OPERATION_TIME: Duration = Duration::from_secs(30);
+
+/// Resolve the canonical `UUIDv7` creation time with at most 1 second of clock
+/// skew. The same ID can never acquire a later horizon on retry.
+#[must_use]
+pub fn http_credential_operation_horizon(
+    request_id: &str,
+    now: std::time::SystemTime,
+) -> Option<std::time::SystemTime> {
+    let id = uuid::Uuid::parse_str(request_id).ok()?;
+    if id.get_version_num() != 7
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.to_string() != request_id
+    {
+        return None;
+    }
+    let (seconds, nanos) = id.get_timestamp()?.to_unix();
+    let created = std::time::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))?;
+    let horizon = created.checked_add(MAX_HTTP_CREDENTIAL_OPERATION_TIME)?;
+    (created <= now.checked_add(Duration::from_secs(1))? && horizon > now).then_some(horizon)
+}
+
+/// Credential authority selected at a verified workload-connect boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedCredentialOrigin {
+    /// A legacy grant remains tied to the verified executable leaf.
+    Connector(crate::proto::VerifiedCredentialConnector),
+    /// Explicit execution-wide grant; the hash names the complete admitted typed policy.
+    Execution { policy_hash: String },
+}
+
 /// Transport-neutral result stream for one HTTP response middleware stage.
 pub type HttpResponseResultStream = Pin<
     Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
@@ -31,12 +64,30 @@ pub type WebSocketResponseStream = Pin<
     >,
 >;
 
+/// Replies on the one authenticated, ordered stream for an accepted protected response.
+pub type InstallationReplyStream = Pin<
+    Box<
+        dyn tokio_stream::Stream<Item = Result<crate::proto::InstallationExchangeReply, Status>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// A middleware implementation reachable either in-process or over a transport.
 ///
 /// Capability is defined by the implementation's manifest. The endpoint hides
 /// whether invocations are direct calls or serialized gRPC requests.
 #[tonic::async_trait]
 pub trait SupervisorMiddlewareEndpoint: Send + Sync {
+    async fn open_installation_exchange(
+        &self,
+        _requests: mpsc::Receiver<crate::proto::InstallationExchangeRequest>,
+    ) -> Result<InstallationReplyStream, Status> {
+        Err(Status::unimplemented(
+            "protected installation exchange is unavailable",
+        ))
+    }
+
     async fn describe(
         &self,
         request: Request<MiddlewareDescribeRequest>,
@@ -353,9 +404,58 @@ pub fn middleware_timeout_or_default(value: &str) -> Result<Duration, String> {
     }
 }
 
+/// Validate portable authored executable pins without consulting the host filesystem.
+/// The trusted identity producer supplies the canonical workload path at admission.
+#[must_use]
+pub fn valid_credential_connector(path: &str, sha256: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.len() <= 4096
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && path[1..]
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_uuid_horizon_is_fixed_and_canonical() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // Independent fixed UUID bytes: the first 48 bits encode 1000 ms.
+        let id = "00000000-03e8-7000-8000-000000000001";
+        let horizon = UNIX_EPOCH + Duration::from_secs(31);
+        for now_ms in [0, 1_000, 20_000, 30_999] {
+            assert_eq!(
+                http_credential_operation_horizon(id, UNIX_EPOCH + Duration::from_millis(now_ms)),
+                Some(horizon)
+            );
+        }
+        assert!(http_credential_operation_horizon(id, horizon).is_none());
+        assert!(
+            http_credential_operation_horizon("00000000-03e8-7000-0000-000000000001", UNIX_EPOCH)
+                .is_none()
+        );
+        assert!(
+            http_credential_operation_horizon("00000000-03E8-7000-8000-000000000001", UNIX_EPOCH)
+                .is_none()
+        );
+        assert!(
+            http_credential_operation_horizon("00000000-03e8-4000-8000-000000000001", UNIX_EPOCH)
+                .is_none()
+        );
+        assert!(
+            http_credential_operation_horizon("00000000-03e9-7000-8000-000000000001", UNIX_EPOCH)
+                .is_none()
+        );
+    }
 
     #[test]
     fn timeout_parser_matches_gateway_interceptor_duration_syntax() {

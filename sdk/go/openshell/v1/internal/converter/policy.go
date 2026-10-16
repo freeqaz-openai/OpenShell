@@ -186,10 +186,11 @@ func SandboxPolicyToProtoChecked(p *types.SandboxPolicy) (*sbv1.SandboxPolicy, e
 
 func middlewareConfigFromProto(m *sbv1.NetworkMiddlewareConfig) types.NetworkMiddlewareConfig {
 	result := types.NetworkMiddlewareConfig{
-		Name:       m.GetName(),
-		Middleware: m.GetMiddleware(),
-		OnError:    m.GetOnError(),
-		Order:      m.GetOrder(),
+		Name:                m.GetName(),
+		Middleware:          m.GetMiddleware(),
+		OnError:             m.GetOnError(),
+		Order:               m.GetOrder(),
+		CredentialAuthority: m.GetCredentialAuthority(),
 	}
 	if c := m.GetConfig(); c != nil {
 		result.Config = c.AsMap()
@@ -205,10 +206,11 @@ func middlewareConfigFromProto(m *sbv1.NetworkMiddlewareConfig) types.NetworkMid
 
 func middlewareConfigToProto(m *types.NetworkMiddlewareConfig) *sbv1.NetworkMiddlewareConfig {
 	result := &sbv1.NetworkMiddlewareConfig{
-		Name:       m.Name,
-		Middleware: m.Middleware,
-		OnError:    m.OnError,
-		Order:      m.Order,
+		Name:                m.Name,
+		Middleware:          m.Middleware,
+		OnError:             m.OnError,
+		Order:               m.Order,
+		CredentialAuthority: m.CredentialAuthority,
 	}
 	if m.Config != nil {
 		// Non-JSON-compatible values (e.g., chan, func) are silently dropped.
@@ -314,7 +316,8 @@ func PolicyStatusResultFromProto(r *pb.GetSandboxPolicyStatusResponse) *types.Po
 		return nil
 	}
 	result := &types.PolicyStatusResult{
-		ActiveVersion: r.GetActiveVersion(),
+		ActiveVersion:     r.GetActiveVersion(),
+		LoadedEnforcement: loadedEnforcementFromProto(r.GetLoadedEnforcement()),
 	}
 	if rev := SandboxPolicyRevisionFromProto(r.GetRevision()); rev != nil {
 		result.Revision = *rev
@@ -387,5 +390,17 @@ func DraftHistoryEntryFromProto(e *pb.DraftHistoryEntry) *types.DraftHistoryEntr
 		EventType:   e.GetEventType(),
 		Description: e.GetDescription(),
 		ChunkID:     e.GetChunkId(),
+	}
+}
+
+func loadedEnforcementFromProto(e *pb.LoadedEnforcementEvidence) *types.LoadedEnforcementEvidence {
+	if e == nil {
+		return nil
+	}
+	return &types.LoadedEnforcementEvidence{
+		SandboxID: e.GetSandboxId(), InstanceID: e.GetInstanceId(),
+		PolicyVersion: e.GetPolicyVersion(), PolicyHash: e.GetPolicyHash(),
+		ConfigRevision: e.GetConfigRevision(), ProviderEnvRevision: e.GetProviderEnvRevision(),
+		EnforcedCapabilities: CopyStringSlice(e.GetEnforcedCapabilities()),
 	}
 }

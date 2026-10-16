@@ -69,9 +69,11 @@ pub(super) fn http_context(
     };
 
     L7EvalContext {
+        credential_connection: decision.endpoint.credential_connection.clone(),
         host: decision.intent.destination.host.clone(),
         port: decision.intent.destination.port,
         request_default_port: None,
+        upstream_transport: crate::l7::tls::UpstreamTransport::Plaintext,
         policy_name,
         binary_path: decision
             .binary
@@ -354,9 +356,11 @@ mod tests {
 
     fn request_context() -> L7EvalContext {
         L7EvalContext {
+            credential_connection: None,
             host: "example.com".to_string(),
             port: 80,
             request_default_port: Some(80),
+            upstream_transport: crate::l7::tls::UpstreamTransport::Plaintext,
             policy_name: "test".to_string(),
             binary_path: String::new(),
             ancestors: vec![],

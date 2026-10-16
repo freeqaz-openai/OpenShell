@@ -1784,6 +1784,11 @@ pub async fn handle_connect_supervisor(
         None => return Err(Status::invalid_argument("stream closed before hello")),
     };
 
+    if !hello.exchange_public_key.is_empty() && principal.is_none() {
+        return Err(Status::unauthenticated(
+            "exchange enrollment requires authentication",
+        ));
+    }
     let sandbox_id = hello.sandbox_id.clone();
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));

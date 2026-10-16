@@ -83,6 +83,22 @@ message NetworkMiddlewareConfig {
   MiddlewareEndpointSelector endpoints = 5;
   // Execution order. Values must be unique within a policy; lower values run first.
   int32 order = 6;
+  // Use this service as the exclusive per-request STATIC credential authority.
+  // Requires authenticated TLS, HTTP_CREDENTIALS/PRE_CREDENTIALS and
+  // HTTP_RESPONSE/PRE_RETURN bindings, and fail_closed. No legacy credential
+  // resolution or token grant is attempted for a selected protected request.
+  bool credential_authority = 7;
+  // Operator-admitted immutable executable identities for the connecting leaf.
+  repeated CredentialConnector credential_connectors = 8;
+  // Explicit new grant: all processes in this execution share mediated egress authority.
+  // Mutually exclusive with credential_connectors; absence preserves narrow legacy grants.
+  bool execution_authority = 9;
+}
+
+// Exact canonical absolute path and lower-case SHA-256 admitted by the operator.
+message CredentialConnector {
+  string path = 1;
+  string sha256 = 2;
 }
 
 // Host selector controlling which admitted destinations use a middleware config.
@@ -356,6 +372,11 @@ message GetSandboxConfigRequest {
   // Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string name = 1;
+  // Supervisor implementation capabilities. Protected policy is withheld from
+  // sandbox callers missing a required capability, including older supervisors.
+  // This declaration never substitutes for post-installation enforcement evidence.
+  // Operator/user inspection may omit it.
+  repeated string supported_enforcement_capabilities = 4;
 }
 
 // Request to get gateway-global settings.

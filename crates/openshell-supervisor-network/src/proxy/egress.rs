@@ -33,6 +33,7 @@ pub(super) struct L7RouteSnapshot {
 /// their existing timing boundaries so upstream-connect behavior stays stable.
 #[derive(Debug, Clone)]
 pub(super) struct EndpointDecision {
+    pub(super) credential_connection: Option<crate::opa::CredentialConnection>,
     pub(super) tls_mode: crate::l7::TlsMode,
     pub(super) l7_route: Option<L7RouteSnapshot>,
     /// Destination authorization selected from the captured endpoint metadata.
@@ -49,6 +50,7 @@ pub(super) struct EndpointDecision {
 impl Default for EndpointDecision {
     fn default() -> Self {
         Self {
+            credential_connection: None,
             tls_mode: crate::l7::TlsMode::Auto,
             l7_route: None,
             destination: None,
@@ -62,6 +64,7 @@ impl Default for EndpointDecision {
 impl EndpointDecision {
     pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
         Self {
+            credential_connection: authorization.credential_connection.clone(),
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),
             exact_declared_host: authorization.exact_declared_endpoint_host,

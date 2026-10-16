@@ -19,8 +19,8 @@ use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
     ExtensionServiceCredential, GetCurrentUserRequest, GetCurrentUserResponse,
-    GetSandboxConfigRequest, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, Sandbox,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, Sandbox,
 };
 use openshell_extension_core::{ExtensionAudience, ExtensionCallerKind, MAX_EXTENSION_TOKEN_TTL};
 use std::collections::{HashMap, HashSet};
@@ -153,6 +153,7 @@ pub async fn handle_refresh_sandbox_token(
     request: Request<RefreshSandboxTokenRequest>,
 ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
     let requested_extension_services = request.get_ref().extension_service_names.clone();
+    let requested_instance = request.get_ref().configuration_instance_id.clone();
     let principal = request
         .extensions()
         .get::<Principal>()
@@ -208,8 +209,14 @@ pub async fn handle_refresh_sandbox_token(
             "gateway token does not match the authenticated sandbox",
         ));
     }
-    let request_hash = crate::auth::sandbox_session::RefreshRequestHash::from_extension_services(
+    // Registration changes and extension minting share the existing mutation
+    // fence. A token is never decorated with an unrequested current instance.
+    let _guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
+        super::persistence_error_to_status(error, "acquire extension registration lock")
+    })?;
+    let request_hash = crate::auth::sandbox_session::RefreshRequestHash::from_extension_request(
         &requested_extension_services,
+        &requested_instance,
     );
     let issued_at = current_unix_seconds();
     let authorization = crate::auth::sandbox_session::authorize_refresh(
@@ -254,26 +261,30 @@ pub async fn handle_refresh_sandbox_token(
             "extension credential minting rate limit exceeded for this sandbox",
         ));
     } else {
-        let mut config_request = Request::new(GetSandboxConfigRequest {
-            name: sandbox_record
-                .metadata
-                .as_ref()
-                .map_or_else(String::new, |metadata| metadata.name.clone()),
-            workspace_scope: None,
+        // The authenticated mint path resolves configuration internally; it is
+        // not a supervisor policy-delivery request or proof of enforcement.
+        let config = super::policy::load_sandbox_config(state, &sandbox_record).await?;
+        let requires_instance = config.policy.as_ref().is_some_and(|policy| {
+            policy
+                .network_middlewares
+                .values()
+                .any(|entry| entry.credential_authority)
         });
-        config_request
-            .extensions_mut()
-            .insert(Principal::Sandbox(sandbox.clone()));
-        let available = super::policy::handle_get_sandbox_config(state, config_request)
-            .await?
-            .into_inner()
-            .supervisor_middleware_services;
-        mint_extension_credentials(
+        let instance_id =
+            validated_extension_instance(&sandbox_record, &requested_instance, requires_instance)?;
+        let current = state
+            .supervisor_sessions
+            .provider_readiness(&sandbox.sandbox_id)?;
+        let exchange_key =
+            instance_id.and_then(|instance| current.as_ref()?.exchange_key(instance));
+        mint_extension_credentials_for_instance(
             issuer,
             &sandbox.sandbox_id,
             &requested_extension_services,
-            &available,
+            &config.supervisor_middleware_services,
             successor.refresh_replay.as_ref(),
+            instance_id,
+            exchange_key,
         )?
     };
     if should_rotate {
@@ -328,12 +339,64 @@ fn current_unix_seconds() -> i64 {
 }
 
 #[allow(clippy::result_large_err)]
+fn validated_extension_instance<'a>(
+    sandbox: &'a Sandbox,
+    requested: &str,
+    required: bool,
+) -> Result<Option<&'a str>, Status> {
+    if requested.is_empty() {
+        return if required {
+            Err(Status::failed_precondition(
+                "protected extension credentials require a registered supervisor instance",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    let current = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .ok_or_else(|| {
+            Status::failed_precondition("supervisor configuration instance is not registered")
+        })?;
+    if uuid::Uuid::parse_str(requested).is_err() || current.instance_id != requested {
+        return Err(Status::failed_precondition(
+            "supervisor configuration instance has changed",
+        ));
+    }
+    Ok(Some(current.instance_id.as_str()))
+}
+
+#[cfg(test)]
+#[allow(clippy::result_large_err)]
 fn mint_extension_credentials(
     issuer: &crate::auth::sandbox_jwt::ExtensionJwtIssuer,
     sandbox_id: &str,
     requested_names: &[String],
     available_services: &[openshell_core::proto::SupervisorMiddlewareService],
     refresh_replay: Option<&crate::auth::sandbox_session::GatewayRefreshReplay>,
+) -> Result<Vec<ExtensionServiceCredential>, Status> {
+    mint_extension_credentials_for_instance(
+        issuer,
+        sandbox_id,
+        requested_names,
+        available_services,
+        refresh_replay,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn mint_extension_credentials_for_instance(
+    issuer: &crate::auth::sandbox_jwt::ExtensionJwtIssuer,
+    sandbox_id: &str,
+    requested_names: &[String],
+    available_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    refresh_replay: Option<&crate::auth::sandbox_session::GatewayRefreshReplay>,
+    instance_id: Option<&str>,
+    exchange_key: Option<&[u8]>,
 ) -> Result<Vec<ExtensionServiceCredential>, Status> {
     if requested_names.len() > MAX_EXTENSION_CREDENTIALS_PER_REFRESH {
         return Err(Status::invalid_argument(format!(
@@ -377,25 +440,23 @@ fn mint_extension_credentials(
             }
             let audience = ExtensionAudience::new(service.audience.clone())
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            let minted = refresh_replay.map_or_else(
-                || {
-                    issuer.mint_extension_token(
-                        &audience,
-                        ExtensionCallerKind::Supervisor,
-                        Some(sandbox_id),
-                        ttl,
-                    )
-                },
+            let (issued_at, token_id) = refresh_replay.map_or_else(
+                || (current_unix_seconds(), uuid::Uuid::new_v4()),
                 |replay| {
-                    issuer.mint_extension_token_with_metadata(
-                        &audience,
-                        ExtensionCallerKind::Supervisor,
-                        Some(sandbox_id),
-                        ttl,
+                    (
                         replay.issued_at,
                         replay.extension_token_id(name, audience.as_str()),
                     )
                 },
+            );
+            let minted = issuer.mint_extension_token_with_metadata(
+                &audience,
+                ExtensionCallerKind::Supervisor,
+                Some(sandbox_id),
+                ttl,
+                (issued_at, token_id),
+                instance_id,
+                exchange_key,
             )?;
             Ok(ExtensionServiceCredential {
                 service_name: name.clone(),
@@ -609,6 +670,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let _ = authorize_refresh(&state, &mut req).await;
@@ -626,6 +688,7 @@ mod tests {
         let state = state_with_ttl(None).await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let _ = authorize_refresh(&state, &mut req).await;
@@ -646,6 +709,7 @@ mod tests {
         let request = || {
             let mut request = Request::new(RefreshSandboxTokenRequest {
                 extension_service_names: Vec::new(),
+                configuration_instance_id: String::new(),
             });
             request
                 .extensions_mut()
@@ -701,6 +765,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut rejected = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: vec!["unknown-service".to_string()],
+            configuration_instance_id: String::new(),
         });
         rejected
             .extensions_mut()
@@ -714,6 +779,7 @@ mod tests {
 
         let mut retry = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         retry
             .extensions_mut()
@@ -820,6 +886,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut()
             .insert(sandbox_principal("sandbox-deleted"));
@@ -940,6 +1007,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
@@ -965,6 +1033,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -1019,6 +1088,7 @@ mod tests {
         .await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         });
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let err = handle_refresh_sandbox_token(&state, req)

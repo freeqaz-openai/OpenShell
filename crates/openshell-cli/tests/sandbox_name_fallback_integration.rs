@@ -540,6 +540,8 @@ impl OpenShell for TestOpenShell {
                 ..Default::default()
             }),
             active_version: 7,
+            loaded_enforcement: None,
+            loaded_policy_observation: None,
         }))
     }
 

@@ -182,6 +182,29 @@ impl ChainRunner {
                 }
                 continue;
             };
+            if entry.entry.credential_authority
+                && matches!(
+                    decision.action,
+                    Some(http_response_preflight_result::Action::Skip(_))
+                )
+            {
+                let reason = "credential_response_requires_whole_body";
+                handle_opened_preflight_failure(
+                    &entry,
+                    &mut current_stage,
+                    &mut stages,
+                    reason,
+                    &mut invocations,
+                )
+                .await;
+                return Ok(failed_preflight_outcome(
+                    headers,
+                    reason.to_string(),
+                    findings,
+                    metadata,
+                    invocations,
+                ));
+            }
             if let Err(reason) = validate_diagnostics(
                 &decision.reason,
                 &decision.reason_code,

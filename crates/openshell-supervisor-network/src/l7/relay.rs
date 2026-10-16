@@ -41,6 +41,7 @@ const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct L7EvalContext {
+    pub(crate) credential_connection: Option<crate::opa::CredentialConnection>,
     /// Host from the CONNECT request.
     pub host: String,
     /// Port from the CONNECT request.
@@ -50,6 +51,8 @@ pub struct L7EvalContext {
     /// Default authority port for the inspected HTTP transport (80 for
     /// plaintext, 443 after TLS termination).
     pub(crate) request_default_port: Option<u16>,
+    /// Actual upstream transport established by the adapter, not request metadata.
+    pub(crate) upstream_transport: crate::l7::tls::UpstreamTransport,
     /// Matched policy name from L4 evaluation.
     pub policy_name: String,
     /// Binary path (for cross-layer Rego evaluation).
@@ -116,6 +119,20 @@ fn scoped_context_for_request(
     scoped.body_classifier = classifier;
     scoped.provider_credential_revision = Some(revision);
     Some(scoped)
+}
+
+fn scoped_context_for_middleware_request(
+    ctx: &L7EvalContext,
+    request: &crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+) -> Option<L7EvalContext> {
+    if openshell_supervisor_middleware::credentials::has_credential_authority(chain) {
+        // The external authority owns selection. Do not even construct a
+        // request-scoped snapshot from the legacy provider credential cache.
+        None
+    } else {
+        scoped_context_for_request(ctx, request)
+    }
 }
 
 fn credential_generation_guard(
@@ -630,9 +647,12 @@ pub(crate) fn http_response_middleware_relay<'a>(
 ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
     let sandbox = openshell_ocsf::ctx::ctx();
     crate::l7::rest::HttpResponseMiddlewareRelay {
+        credential_connection: ctx.credential_connection.as_ref(),
+        upstream_transport: ctx.upstream_transport,
         chain,
         runner,
         request_context: openshell_core::proto::RequestContext {
+            verified_credential_connector: None,
             request_id: request_id.to_string(),
             sandbox_id: sandbox.sandbox_id.clone(),
             sandbox: sandbox.sandbox_name.clone(),
@@ -953,6 +973,11 @@ where
 
         // Pin observation authority before parsing can await or a later
         // provider lookup can select state from another installation.
+        let mut accepted = super::rest::AcceptedResponseSink::capture(
+            client,
+            ctx.credential_connection.is_some(),
+        )?;
+        let client = accepted.client();
         let observation_context = ctx
             .endpoint_observation_tx
             .as_ref()
@@ -1198,7 +1223,7 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let request_id = uuid::Uuid::now_v7().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
@@ -1257,7 +1282,7 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
+            let scoped_ctx = scoped_context_for_middleware_request(ctx, &req, &response_chain);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             // Credential scoping can acquire a newer revision after middleware.
             // Bind its actual snapshot to the original authority, never a fresh
@@ -1302,46 +1327,58 @@ where
             } else {
                 None
             };
+            let options = crate::l7::rest::RelayRequestOptions {
+                resolver: ctx.secret_resolver.as_deref(),
+                body_classifier: ctx.body_classifier.as_deref(),
+                mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
+                    crate::l7::rest::McpRequestValidation {
+                        config,
+                        ctx,
+                        redacted_target: &redacted_target,
+                    },
+                ),
+                credential_generation: credential_generation_guard(ctx),
+                generation_guard: Some(engine.generation_guard()),
+                websocket_extensions: websocket_extension_mode(
+                    config,
+                    middleware_session.is_some(),
+                ),
+                request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                    && config.request_body_credential_rewrite,
+                deny_uninspected_credentials: config
+                    .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+                credential_signing: config.credential_signing,
+                signing_service: &config.signing_service,
+                signing_region: &config.signing_region,
+                host: &ctx.host,
+                port: ctx.port,
+            };
+            let middleware = http_response_middleware_relay(
+                &req,
+                ctx,
+                ctx.upstream_transport.scheme(),
+                &request_id,
+                &response_chain,
+                engine.middleware_runner(),
+                Some(engine.generation_guard()),
+            );
+            if openshell_supervisor_middleware::credentials::has_credential_authority(
+                &response_chain,
+            ) {
+                // Complete custody is terminal: this sink, operation and permit cannot be rebound or reused.
+                accepted
+                    .relay(&req, upstream, options, middleware, observer.as_ref())
+                    .await?;
+                return Ok(());
+            }
+            let client = accepted.client();
             let outcome_result = relay_http_request_with_credential_rejection_observed(
                 &req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
-                        crate::l7::rest::McpRequestValidation {
-                            config,
-                            ctx,
-                            redacted_target: &redacted_target,
-                        },
-                    ),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
-                },
+                options,
                 ctx,
-                Some(http_response_middleware_relay(
-                    &req,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
+                Some(middleware),
                 observer.as_ref(),
             )
             .await;
@@ -1853,6 +1890,11 @@ where
         }
 
         // Parse one HTTP request from client
+        let mut accepted = super::rest::AcceptedResponseSink::capture(
+            client,
+            ctx.credential_connection.is_some(),
+        )?;
+        let client = accepted.client();
         let req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
@@ -1981,7 +2023,7 @@ where
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let request_id = uuid::Uuid::now_v7().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
@@ -2069,7 +2111,13 @@ where
                 None
             };
             let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                match if openshell_supervisor_middleware::credentials::has_credential_authority(
+                    &response_chain,
+                ) {
+                    Ok(req)
+                } else {
+                    crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
+                } {
                     Ok(req) => req,
                     Err(e) => {
                         warn!(
@@ -2082,44 +2130,57 @@ where
                         return Ok(());
                     }
                 };
-            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
+            let scoped_ctx =
+                scoped_context_for_middleware_request(ctx, &req_with_auth, &response_chain);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
 
             // Forward request to upstream and relay response
+            let options = crate::l7::rest::RelayRequestOptions {
+                resolver: ctx.secret_resolver.as_deref(),
+                body_classifier: ctx.body_classifier.as_deref(),
+                mcp_request_validation: None,
+                credential_generation: credential_generation_guard(ctx),
+                generation_guard: Some(engine.generation_guard()),
+                websocket_extensions: websocket_extension_mode(
+                    config,
+                    middleware_session.is_some(),
+                ),
+                request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                    && config.request_body_credential_rewrite,
+                deny_uninspected_credentials: config
+                    .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+                credential_signing: config.credential_signing,
+                signing_service: &config.signing_service,
+                signing_region: &config.signing_region,
+                host: &ctx.host,
+                port: ctx.port,
+            };
+            let middleware = http_response_middleware_relay(
+                &req_with_auth,
+                ctx,
+                ctx.upstream_transport.scheme(),
+                &request_id,
+                &response_chain,
+                engine.middleware_runner(),
+                Some(engine.generation_guard()),
+            );
+            if openshell_supervisor_middleware::credentials::has_credential_authority(
+                &response_chain,
+            ) {
+                // Complete custody is terminal: this sink, operation and permit cannot be rebound or reused.
+                accepted
+                    .relay(&req_with_auth, upstream, options, middleware, None)
+                    .await?;
+                return Ok(());
+            }
+            let client = accepted.client();
             let outcome_result = relay_http_request_with_credential_rejection(
                 &req_with_auth,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    body_classifier: ctx.body_classifier.as_deref(),
-                    mcp_request_validation: None,
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
-                },
+                options,
                 ctx,
-                Some(http_response_middleware_relay(
-                    &req_with_auth,
-                    ctx,
-                    "https",
-                    &request_id,
-                    &response_chain,
-                    engine.middleware_runner(),
-                    Some(engine.generation_guard()),
-                )),
+                Some(middleware),
             )
             .await;
             let outcome_result = match outcome_result {
@@ -2444,7 +2505,7 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let request_id = uuid::Uuid::now_v7().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
@@ -2502,7 +2563,7 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
+            let scoped_ctx = scoped_context_for_middleware_request(ctx, &req, &response_chain);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             // The outgoing resolver and revision are one snapshot. Rebind using
             // the original authority so a newly scoped provider revision cannot
@@ -2538,7 +2599,7 @@ where
                 Some(http_response_middleware_relay(
                     &req,
                     ctx,
-                    "https",
+                    ctx.upstream_transport.scheme(),
                     &request_id,
                     &response_chain,
                     engine.middleware_runner(),
@@ -2749,7 +2810,7 @@ where
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let response_chain = chain.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let request_id = uuid::Uuid::now_v7().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
@@ -2804,7 +2865,7 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
+            let scoped_ctx = scoped_context_for_middleware_request(ctx, &req, &response_chain);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             let Some(outcome) = relay_http_request_with_credential_rejection(
                 &req,
@@ -2821,7 +2882,7 @@ where
                 Some(http_response_middleware_relay(
                     &req,
                     ctx,
-                    "https",
+                    ctx.upstream_transport.scheme(),
                     &request_id,
                     &response_chain,
                     engine.middleware_runner(),
@@ -3261,7 +3322,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = serde_json::json!({
+    let mut input = serde_json::json!({
         "network": {
             "host": ctx.host,
             "port": ctx.port,
@@ -3279,6 +3340,12 @@ fn evaluate_l7_request_once(
             "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
     });
+
+    if let Some(connection) = &ctx.credential_connection
+        && connection.is_execution_for(&ctx.host, ctx.port, engine.generation_guard())?
+    {
+        input["network"]["verified_execution_connect"] = true.into();
+    }
 
     let mut engine = engine
         .engine()
@@ -3390,7 +3457,7 @@ where
             ocsf_emit!(event);
         }
 
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = uuid::Uuid::now_v7().to_string();
         let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
@@ -6176,6 +6243,8 @@ network_policies:
             body_length: crate::l7::provider::BodyLength::None,
         };
         let fail_open = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "m".into(),
             implementation: "openshell/regex".into(),
             order: 0,
@@ -6221,6 +6290,8 @@ network_policies:
         use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
 
         let resolved = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "redact".into(),
             implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
@@ -6228,6 +6299,8 @@ network_policies:
             on_error: OnError::FailClosed,
         };
         let unresolved = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -6867,6 +6940,8 @@ network_policies:
         use openshell_supervisor_middleware::{ChainEntry, OnError};
 
         let entry = |on_error| ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "m".into(),
             implementation: "example/guard".into(),
             order: 0,
@@ -6977,6 +7052,8 @@ network_policies:
         let runner = ChainRunner::from_registry(registry);
         let chain = vec![
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "redact".into(),
                 implementation: "test/redactor".into(),
                 order: 0,
@@ -6984,6 +7061,8 @@ network_policies:
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "guard".into(),
                 implementation: "test/guard".into(),
                 order: 10,

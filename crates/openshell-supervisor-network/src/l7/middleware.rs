@@ -85,9 +85,12 @@ impl HttpMiddlewareExchange {
     ) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
         let sandbox = openshell_ocsf::ctx::ctx();
         crate::l7::rest::HttpResponseMiddlewareRelay {
+            credential_connection: ctx.credential_connection.as_ref(),
+            upstream_transport: ctx.upstream_transport,
             chain: &self.chain,
             runner: &self.runner,
             request_context: openshell_core::proto::RequestContext {
+                verified_credential_connector: None,
                 request_id: self.request_id.clone(),
                 sandbox_id: sandbox.sandbox_id.clone(),
                 sandbox: sandbox.sandbox_name.clone(),
@@ -134,10 +137,10 @@ pub fn uninspectable_traffic_gate(
     if chain.is_empty() {
         return UninspectableTrafficGate::Unrestricted;
     }
-    if chain
-        .iter()
-        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen)
-    {
+    if chain.iter().all(|entry| {
+        !entry.credential_authority
+            && entry.on_error == openshell_supervisor_middleware::OnError::FailOpen
+    }) {
         UninspectableTrafficGate::BypassWithFinding
     } else {
         UninspectableTrafficGate::Deny
@@ -521,7 +524,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         req,
         client,
         ctx,
-        "https",
+        ctx.upstream_transport.scheme(),
         chain,
         runner,
         generation_guard,
@@ -547,6 +550,17 @@ pub async fn apply_middleware_chain_for_scheme_with_request_id<
 ) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
+    }
+    if openshell_supervisor_middleware::credentials::has_credential_authority(&chain) {
+        // Refuse unsupported transports before any request-time token grant or
+        // legacy credential rewrite can run. Upgrades escape per-request checks.
+        if ctx.upstream_transport != crate::l7::tls::UpstreamTransport::AuthenticatedTls
+            || scheme != "https"
+            || crate::l7::rest::request_has_upgrade_header(&req.raw_header)
+            || runner.credential_authority(&chain).await.is_err()
+        {
+            return Ok(MiddlewareApplyResult::Denied { denial: None });
+        }
     }
     let chain = runner.describe_chain(&chain).await?;
     let admission = if chain.is_empty() {
@@ -741,7 +755,7 @@ pub(super) fn middleware_request_input(
     query: String,
     body: Vec<u8>,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = uuid::Uuid::now_v7().to_string();
     middleware_request_input_with_id(
         sandbox,
         scheme,
@@ -820,12 +834,12 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
 /// upstream will receive. Credential-bearing and hop-by-hop headers are
 /// omitted, while dynamically nominated names are retained separately for
 /// mutation validation.
-struct SafeMiddlewareHeaders {
-    visible: Vec<(String, String)>,
+pub(super) struct SafeMiddlewareHeaders {
+    pub(super) visible: Vec<(String, String)>,
     connection_nominated: Vec<String>,
 }
 
-fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
+pub(super) fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
     crate::l7::rest::validate_http_request_header_block(headers)?;
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;

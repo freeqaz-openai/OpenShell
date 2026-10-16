@@ -157,6 +157,27 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
   Configuration passed to the middleware. The middleware defines and validates its format.
 </ParamField>
 
+<ParamField path="credential_authority" type="boolean" default="false">
+  Select this service as the exclusive external STATIC credential authority for
+  matching requests. Requires authenticated HTTPS, the policy's complete
+  enforcement profile, a response-policy binding, and `fail_closed`. See
+  [External static credentials](/extensibility/supervisor-middleware/operations#external-static-credentials).
+</ParamField>
+
+<ParamField path="credential_connectors" type="array">
+  For a credential authority with executable pins, supply 1–64 exact
+  canonical absolute `path` and lowercase SHA-256 `sha256` pairs admitted by
+  the operator. The actual connecting leaf must match a complete pair at network
+  admission through a trusted transparent mediated connect. Explicit CONNECT and
+  post-connect procfs identity cannot authorize credentials. Protected selectors
+  support one literal host without exclusions.
+</ParamField>
+
+<ParamField path="execution_authority" type="boolean" default="false">
+  Instead of executable pins, a new credential-authority policy may explicitly
+  grant mediated HTTPS access to processes throughout this workload.
+</ParamField>
+
 <ParamField path="name" type="string">
   Display name. Defaults to the map key.
 </ParamField>
@@ -164,6 +185,11 @@ The map key, such as `content-guard`, is the entry's stable identity in logs. Ea
 [Policy Schema](/how-it-works/policies/schema#network-middleware) lists every field and limit.
 
 ## Choose Failure Behavior
+
+An entry with `credential_authority: true` cannot use `fail_open`. Exactly one
+credential authority may match a protected request. Missing capabilities,
+unavailable authority, ambiguous selection, and invalid results block the
+request without trying another provider or the ordinary credential cache.
 
 Middleware fails when it cannot complete its check, for example when its service is unavailable, times out, returns an invalid result, or receives a payload over its limit. By default, OpenShell blocks the affected request, response, or WebSocket connection. The `on_error` field on a policy entry controls this behavior.
 

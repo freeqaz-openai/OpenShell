@@ -545,6 +545,9 @@ network rules allow, in ascending `order`.
 | `order` | integer | No | Run order. Lower values run first. Values must be unique. Defaults to `0`. |
 | `config` | object | No | Configuration for the middleware. |
 | `on_error` | string | No | `fail_closed` blocks traffic when the middleware fails. `fail_open` skips it. Defaults to `fail_closed`. |
+| `credential_connectors` | list of objects | For credential authority | For an executable-pinned policy, supply 1–64 operator-admitted canonical absolute `path` and lowercase 64-character `sha256` pairs. The verified connecting leaf must match one complete pair. Requires one literal host selector without exclusions. |
+| `credential_authority` | boolean | No | Select an authenticated external STATIC credential authority. Defaults to `false`; requires `fail_closed` and the [credential-access protocol](/extensibility/supervisor-middleware/operations#external-static-credentials). |
+| `execution_authority` | boolean | No | Explicitly grant mediated access throughout the workload instead of pinning connecting executables. Requires `credential_authority`. |
 | `name` | string | No | Display name. Defaults to the key. |
 
 Host patterns match the same way as endpoint hosts, up to 32 patterns per

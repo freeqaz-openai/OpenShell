@@ -294,6 +294,30 @@ pub(super) fn permitted_body_modes(
     entry: &DescribedChainEntry,
     body_restriction: Option<&str>,
 ) -> Vec<i32> {
+    // Credential custody requires a complete trusted decision. The protected
+    // HTTP relay imposes a total byte bound and the original operation deadline,
+    // so a finite SSE response can use the same whole-body contract as JSON.
+    // Other streaming protocols and restricted/encoded bodies remain refused.
+    if entry.entry.credential_authority {
+        let finite_sse = input.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-type")
+                && header
+                    .value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+        return if body_restriction.is_none()
+            && input
+                .declared_body_length
+                .is_none_or(|length| length <= entry.max_payload_bytes as u64)
+            && (finite_sse || !is_open_ended_response(input))
+        {
+            vec![HttpResponseBodyMode::WholeBodyBytes as i32]
+        } else {
+            Vec::new()
+        };
+    }
     let mut modes = vec![HttpResponseBodyMode::HeadersOnly as i32];
     if body_restriction.is_some() {
         return modes;

@@ -43,6 +43,7 @@ pub struct SessionRuntimeContext {
     pub instance_id: String,
     /// Publishes the currently accepted gateway session to sibling reporters.
     pub session_id_updates: Option<watch::Sender<Option<String>>>,
+    pub extension_credentials: openshell_extension_core::ExtensionCredentialStore,
 }
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
@@ -335,6 +336,7 @@ pub fn spawn_with_readiness(
         terminating,
         instance_id: runtime.instance_id,
         session_id_updates: runtime.session_id_updates,
+        extension_credentials: runtime.extension_credentials,
         ready_tx,
     };
     (tokio::spawn(run_session_loop(config)), ready_rx)
@@ -350,6 +352,7 @@ struct SessionConfig {
     instance_id: String,
     /// Publishes the currently accepted session to sibling control-plane reporters.
     session_id_updates: Option<watch::Sender<Option<String>>>,
+    extension_credentials: openshell_extension_core::ExtensionCredentialStore,
     ready_tx: watch::Sender<bool>,
 }
 
@@ -415,6 +418,10 @@ async fn run_single_session(
             instance_id: config.instance_id.clone(),
             connection_epoch,
             supports_provider_readiness: true,
+            exchange_public_key: config
+                .extension_credentials
+                .installation()
+                .map_or_else(Vec::new, |(_, key)| key.public_key().to_vec()),
         })),
     })
     .await
@@ -456,6 +463,7 @@ async fn run_single_session(
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
     ocsf_emit!(event);
+    config.extension_credentials.session_enrolled();
     config.ready_tx.send_replace(true);
 
     // Main loop: receive gateway messages + send heartbeats.

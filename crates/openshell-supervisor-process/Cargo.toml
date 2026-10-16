@@ -16,6 +16,7 @@ openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 
 anyhow = { workspace = true }
+openshell-extension-core = { path = "../openshell-extension-core" }
 async-trait = "0.1"
 base64 = { workspace = true }
 bytes = { workspace = true }

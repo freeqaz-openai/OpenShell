@@ -252,6 +252,24 @@ where
     Ok(tls_stream)
 }
 
+/// Supervisor-observed upstream protection, never inferred from HTTP fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UpstreamTransport {
+    #[default]
+    Plaintext,
+    /// Set only after the upstream TLS handshake verifies the peer.
+    AuthenticatedTls,
+}
+
+impl UpstreamTransport {
+    pub(crate) fn scheme(self) -> &'static str {
+        match self {
+            Self::Plaintext => "http",
+            Self::AuthenticatedTls => "https",
+        }
+    }
+}
+
 /// Connect TLS to an upstream server, verifying against the configured CA roots.
 ///
 /// Returns a TLS stream for re-encrypted upstream communication.

@@ -11,6 +11,7 @@ use tonic::{Request, Status};
 #[derive(Clone)]
 pub struct BearerTokenSlot {
     inner: Arc<RwLock<Option<Token>>>,
+    pub(crate) installation_key: Option<crate::InstallationSigningKey>,
 }
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ impl BearerTokenSlot {
     pub fn empty() -> Self {
         Self {
             inner: Arc::new(RwLock::new(None)),
+            installation_key: None,
         }
     }
 
@@ -75,6 +77,11 @@ impl BearerTokenSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|token| token.expires_at_ms)
+    }
+
+    /// Possession from this supervisor's store, never parsed or created from the token.
+    pub fn installation_key(&self) -> Option<&crate::InstallationSigningKey> {
+        self.installation_key.as_ref()
     }
 
     pub fn interceptor(&self) -> BearerTokenInterceptor {

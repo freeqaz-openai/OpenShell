@@ -28,6 +28,15 @@ pub enum ExtensionCallerKind {
     Supervisor,
 }
 
+/// Gateway-signed binding to a key enrolled through the current supervisor hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeKey {
+    pub profile: String,
+    pub kty: String,
+    pub crv: String,
+    pub x: String,
+}
+
 /// JWT claim set accepted by external extension services.
 ///
 /// This intentionally differs from sandbox bootstrap claims. Sharing a signing
@@ -43,6 +52,12 @@ pub struct ExtensionJwtClaims {
     pub caller_kind: ExtensionCallerKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
+    /// Validated supervisor configuration registration; absent for legacy and
+    /// gateway callers. This is not remote binary attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_key: Option<ExchangeKey>,
 }
 
 #[cfg(test)]
@@ -72,9 +87,12 @@ mod tests {
             jti: "unique".to_string(),
             caller_kind: ExtensionCallerKind::Gateway,
             sandbox_id: None,
+            instance_id: None,
+            exchange_key: None,
         };
         let json = serde_json::to_value(claims).unwrap();
         assert!(json.get("sandbox_id").is_none());
+        assert!(json.get("instance_id").is_none());
         assert_eq!(json["caller_kind"], "gateway");
     }
 }

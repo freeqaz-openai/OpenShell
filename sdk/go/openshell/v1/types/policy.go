@@ -142,6 +142,9 @@ type NetworkMiddlewareConfig struct {
 	OnError    string
 	Endpoints  *MiddlewareEndpointSelector
 	Order      int32
+	// CredentialAuthority selects an exclusive authenticated STATIC credential authority.
+	// The attachment must be fail_closed and support the credential-access protocol.
+	CredentialAuthority bool
 }
 
 // MiddlewareEndpointSelector controls which admitted destinations use a
@@ -204,6 +207,21 @@ type PolicyStatusResult struct {
 	Revision SandboxPolicyRevision
 	// ActiveVersion is the currently active (loaded) policy version.
 	ActiveVersion uint32
+	// LoadedEnforcement is the current supervisor's installed-capability observation.
+	// Absence never qualifies protected enforcement; a saved receipt is not a lease.
+	LoadedEnforcement *LoadedEnforcementEvidence
+}
+
+// LoadedEnforcementEvidence binds runtime enforcement to one installed configuration.
+// Requery policy status before relying on it; it is not per-operation authorization.
+type LoadedEnforcementEvidence struct {
+	SandboxID            string
+	InstanceID           string
+	PolicyVersion        uint32
+	PolicyHash           string
+	ConfigRevision       uint64
+	ProviderEnvRevision  uint64
+	EnforcedCapabilities []string
 }
 
 // ApproveResult contains the result of approving a single draft chunk.

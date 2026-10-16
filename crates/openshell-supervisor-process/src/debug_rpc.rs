@@ -78,6 +78,7 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
         .get_sandbox_config(GetSandboxConfigRequest {
             name: sandbox_name.to_string(),
             workspace_scope: None,
+            supported_enforcement_capabilities: Vec::new(),
         })
         .await;
     match resp {
@@ -108,6 +109,7 @@ async fn run_refresh() -> Result<i32> {
     let resp = client
         .refresh_sandbox_token(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
+            configuration_instance_id: String::new(),
         })
         .await;
     match resp {

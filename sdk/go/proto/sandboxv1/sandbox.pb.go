@@ -634,9 +634,14 @@ type NetworkMiddlewareConfig struct {
 	// Host selector controlling which admitted destinations use this config.
 	Endpoints *MiddlewareEndpointSelector `protobuf:"bytes,5,opt,name=endpoints,proto3" json:"endpoints,omitempty"`
 	// Execution order. Values must be unique within a policy; lower values run first.
-	Order         int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Order int32 `protobuf:"varint,6,opt,name=order,proto3" json:"order,omitempty"`
+	// Use this service as the exclusive per-request STATIC credential authority.
+	// Requires authenticated TLS, HTTP_CREDENTIALS/PRE_CREDENTIALS and
+	// HTTP_RESPONSE/PRE_RETURN bindings, and fail_closed. No legacy credential
+	// resolution or token grant is attempted for a selected protected request.
+	CredentialAuthority bool `protobuf:"varint,7,opt,name=credential_authority,json=credentialAuthority,proto3" json:"credential_authority,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *NetworkMiddlewareConfig) Reset() {
@@ -709,6 +714,13 @@ func (x *NetworkMiddlewareConfig) GetOrder() int32 {
 		return x.Order
 	}
 	return 0
+}
+
+func (x *NetworkMiddlewareConfig) GetCredentialAuthority() bool {
+	if x != nil {
+		return x.CredentialAuthority
+	}
+	return false
 }
 
 // Host selector controlling which admitted destinations use a middleware config.
@@ -1661,8 +1673,13 @@ type GetSandboxConfigRequest struct {
 	// Workspace scope. Select one named workspace; authenticated sandbox callers may omit it during bootstrap.
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	Name           string                         `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Supervisor implementation capabilities. Protected policy is withheld from
+	// sandbox callers missing a required capability, including older supervisors.
+	// This declaration never substitutes for post-installation enforcement evidence.
+	// Operator/user inspection may omit it.
+	SupportedEnforcementCapabilities []string `protobuf:"bytes,4,rep,name=supported_enforcement_capabilities,json=supportedEnforcementCapabilities,proto3" json:"supported_enforcement_capabilities,omitempty"`
+	unknownFields                    protoimpl.UnknownFields
+	sizeCache                        protoimpl.SizeCache
 }
 
 func (x *GetSandboxConfigRequest) Reset() {
@@ -1707,6 +1724,13 @@ func (x *GetSandboxConfigRequest) GetName() string {
 		return x.Name
 	}
 	return ""
+}
+
+func (x *GetSandboxConfigRequest) GetSupportedEnforcementCapabilities() []string {
+	if x != nil {
+		return x.SupportedEnforcementCapabilities
+	}
+	return nil
 }
 
 // Request to get gateway-global settings.
@@ -2305,7 +2329,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +
-	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xff\x01\n" +
+	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\xb2\x02\n" +
 	"\x17NetworkMiddlewareConfig\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1e\n" +
 	"\n" +
@@ -2314,7 +2338,8 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x06config\x18\x03 \x01(\v2\x17.google.protobuf.StructR\x06config\x12\x19\n" +
 	"\bon_error\x18\x04 \x01(\tR\aonError\x12N\n" +
 	"\tendpoints\x18\x05 \x01(\v20.openshell.sandbox.v1.MiddlewareEndpointSelectorR\tendpoints\x12\x14\n" +
-	"\x05order\x18\x06 \x01(\x05R\x05order\"P\n" +
+	"\x05order\x18\x06 \x01(\x05R\x05order\x121\n" +
+	"\x14credential_authority\x18\a \x01(\bR\x13credentialAuthority\"P\n" +
 	"\x1aMiddlewareEndpointSelector\x12\x18\n" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
 	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
@@ -2403,10 +2428,11 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\x81\x01\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"\xcf\x01\n" +
 	"\x17GetSandboxConfigRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x03 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\"\x19\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12L\n" +
+	"\"supported_enforcement_capabilities\x18\x04 \x03(\tR supportedEnforcementCapabilities\"\x19\n" +
 	"\x17GetGatewayConfigRequest\"\x82\x02\n" +
 	"\x18GetGatewayConfigResponse\x12X\n" +
 	"\bsettings\x18\x01 \x03(\v2<.openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntryR\bsettings\x12+\n" +

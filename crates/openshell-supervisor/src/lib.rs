@@ -672,7 +672,9 @@ pub async fn run_sandbox(
     // Extension credentials are owned by this supervisor and shared by every
     // gateway connection it opens, so the middleware registry's bearer slots
     // and the policy poll loop that rotates them stay the same objects.
-    let extension_credentials = openshell_extension_core::ExtensionCredentialStore::new();
+    let extension_credentials =
+        openshell_extension_core::ExtensionCredentialStore::new_installation()
+            .map_err(|_| miette::miette!("cannot establish supervisor installation possession"))?;
 
     let runtime_descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
         serde_json::from_slice(&backend_descriptor.payload)
@@ -1168,6 +1170,7 @@ pub async fn run_sandbox(
             running.loopback_connector(),
             agent.clone(),
             Some(supervisor_session_updates),
+            extension_credentials.clone(),
         )
         .await?;
         info!(backend = %backend_name, "Control-mode access plane started");
@@ -1972,7 +1975,19 @@ trait StartupGateway: Send + Sync {
         snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
         state: openshell_core::proto::ConfigurationAdmissionState,
         error: &str,
+        loaded_enforcement: Option<openshell_core::proto::LoadedEnforcementEvidence>,
     ) -> Result<()>;
+}
+
+fn enforced_runtime_capabilities() -> Vec<String> {
+    openshell_core::extension_protocol::HTTP_CREDENTIAL_REQUIRED_CAPABILITIES
+        .into_iter()
+        .chain([
+            openshell_core::extension_protocol::HTTP_EXECUTION_AUTHORITY_CAPABILITY,
+            openshell_core::extension_protocol::HTTP_PROTECTED_NO_MATERIAL_CAPABILITY,
+        ])
+        .map(str::to_string)
+        .collect()
 }
 
 struct RemoteStartupGateway {
@@ -1985,7 +2000,12 @@ impl StartupGateway for RemoteStartupGateway {
         &self,
         sandbox: &str,
     ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        openshell_core::grpc_client::fetch_settings_snapshot(&self.endpoint, sandbox).await
+        openshell_core::grpc_client::fetch_settings_snapshot_with_capabilities(
+            &self.endpoint,
+            sandbox,
+            &enforced_runtime_capabilities(),
+        )
+        .await
     }
     async fn provider(
         &self,
@@ -1999,11 +2019,12 @@ impl StartupGateway for RemoteStartupGateway {
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
     ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
-        openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
+        openshell_core::grpc_client::sync_policy_and_fetch_snapshot_with_capabilities(
             &self.endpoint,
             sandbox,
             policy,
             workspace,
+            &enforced_runtime_capabilities(),
         )
         .await
     }
@@ -2014,14 +2035,16 @@ impl StartupGateway for RemoteStartupGateway {
         snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
         state: openshell_core::proto::ConfigurationAdmissionState,
         error: &str,
+        loaded_enforcement: Option<openshell_core::proto::LoadedEnforcementEvidence>,
     ) -> Result<()> {
-        openshell_core::grpc_client::report_sandbox_configuration(
+        openshell_core::grpc_client::report_sandbox_configuration_with_enforcement(
             &self.endpoint,
             id,
             instance_id,
             snapshot,
             state,
             error,
+            loaded_enforcement,
         )
         .await
     }
@@ -2208,7 +2231,10 @@ async fn load_policy_with_gateway(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let instance_id = uuid::Uuid::new_v4().to_string();
+        let instance_id = extension_credentials.installation().map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |(instance, _)| instance.to_string(),
+        );
         // Capture the previous instance once. Registration retries must never
         // rebase this fence and displace a newer supervisor instance.
         let registration_snapshot =
@@ -2220,6 +2246,7 @@ async fn load_policy_with_gateway(
                 Some(&registration_snapshot),
                 ConfigurationAdmissionState::Pending,
                 "",
+                None,
             )
         })
         .await?;
@@ -2402,6 +2429,7 @@ async fn load_policy_with_gateway(
             let middleware_services = middleware_services.clone();
             let extension_credentials = extension_credentials.clone();
             let extension_authentication_enabled = snapshot.extension_authentication_enabled;
+            let instance_id = instance_id.clone();
             async move {
                 let credentials = if extension_authentication_enabled {
                     // Share the supervisor's store so the slots installed here
@@ -2411,6 +2439,7 @@ async fn load_policy_with_gateway(
                         extension_credentials,
                     )
                     .await?
+                    .with_configuration_instance(instance_id.clone())
                     .refresh_extension_credentials(&middleware_services)
                     .await?
                 } else {
@@ -2447,6 +2476,32 @@ async fn load_policy_with_gateway(
         } else {
             MiddlewareRegistryStatus::Synchronized
         };
+            let generation = engine.generation_guard(engine.current_generation())?;
+            let admission = openshell_core::proto::SandboxConfigurationAdmission {
+                instance_id: instance_id.clone(),
+                state: ConfigurationAdmissionState::Accepted.into(),
+                policy_version: snapshot.version,
+                policy_hash: snapshot.policy_hash.clone(),
+                config_revision: snapshot.config_revision,
+                provider_env_revision: snapshot.provider_env_revision,
+                ..Default::default()
+            };
+            let Ok(evidence) = engine
+                .loaded_enforcement_evidence(&generation, id, &admission)
+                .await
+            else {
+                reject_startup_configuration(
+                    gateway,
+                    &mut rejection_log,
+                    id,
+                    &instance_id,
+                    &snapshot,
+                    "Installed middleware cannot enforce the requested capabilities",
+                )
+                .await?;
+                reconciliation_attempts = 0;
+                continue;
+            };
             let opa_engine = Some(engine);
 
             // The gateway compares the entire tuple again. A concurrent repair or
@@ -2460,6 +2515,7 @@ async fn load_policy_with_gateway(
                     Some(&snapshot),
                     ConfigurationAdmissionState::Accepted,
                     "",
+                    Some(evidence),
                 ),
             )
             .await
@@ -2632,6 +2688,7 @@ async fn reject_startup_configuration(
             Some(snapshot),
             openshell_core::proto::ConfigurationAdmissionState::Rejected,
             error,
+            None,
         )
     })
     .await?;
@@ -3805,6 +3862,7 @@ async fn report_runtime_configuration(
     snapshot: &openshell_core::grpc_client::SettingsPollResult,
     accepted: bool,
     error: &str,
+    generation: Option<&PolicyGenerationGuard>,
 ) -> bool {
     let LoadedPolicyOrigin::Gateway {
         revision: Some(revision),
@@ -3831,13 +3889,49 @@ async fn report_runtime_configuration(
                 .build()
         );
     }
-    openshell_core::grpc_client::report_sandbox_configuration(
+    let loaded_enforcement = if accepted {
+        let Some(generation) = generation else {
+            return false;
+        };
+        let admission = openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: instance_id.to_string(),
+            state: state.into(),
+            policy_version: snapshot.version,
+            policy_hash: snapshot.policy_hash.clone(),
+            config_revision: snapshot.config_revision,
+            provider_env_revision: snapshot.provider_env_revision,
+            ..Default::default()
+        };
+        let Ok(evidence) = ctx
+            .opa_engine
+            .loaded_enforcement_evidence(generation, &ctx.sandbox_id, &admission)
+            .await
+        else {
+            // Withdraw a previously accepted observation if the actual installed
+            // policy/registry can no longer substantiate it.
+            let _ = openshell_core::grpc_client::report_sandbox_configuration(
+                &ctx.endpoint,
+                &ctx.sandbox_id,
+                instance_id,
+                Some(snapshot),
+                openshell_core::proto::ConfigurationAdmissionState::Rejected,
+                "Installed middleware cannot enforce the requested capabilities",
+            )
+            .await;
+            return false;
+        };
+        Some(evidence)
+    } else {
+        None
+    };
+    openshell_core::grpc_client::report_sandbox_configuration_with_enforcement(
         &ctx.endpoint,
         &ctx.sandbox_id,
         instance_id,
         Some(snapshot),
         state,
         error,
+        loaded_enforcement,
     )
     .await
     .is_ok()
@@ -3849,7 +3943,20 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         ctx.extension_credentials.clone(),
     )
     .await?;
-    run_policy_poll_loop_with_client(ctx, client).await
+    let instance_id = match &ctx.loaded_policy_origin {
+        LoadedPolicyOrigin::Gateway {
+            revision: Some(revision),
+            ..
+        } => revision.admission_instance_id.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    run_policy_poll_loop_with_client(
+        ctx,
+        client
+            .with_enforcement_capabilities(enforced_runtime_capabilities())
+            .with_configuration_instance(instance_id),
+    )
+    .await
 }
 
 async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
@@ -3943,6 +4050,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         ctx.provider_credentials.snapshot().revision,
                     )
                     .await;
+                    if !report_runtime_configuration(&ctx, &result, true, "", Some(generation))
+                        .await
+                    {
+                        current_config_revision = 0;
+                    }
                     current_middleware_services = result.supervisor_middleware_services;
                     current_extension_authentication_enabled =
                         result.extension_authentication_enabled;
@@ -4055,7 +4167,8 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 validation_error: result.configuration_error.clone(),
                 configured_mode: result.policy_validation_failure_mode,
             });
-            report_runtime_configuration(&ctx, &result, false, &result.configuration_error).await;
+            report_runtime_configuration(&ctx, &result, false, &result.configuration_error, None)
+                .await;
             continue;
         }
 
@@ -4234,6 +4347,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         &result,
                         false,
                         "Provider environment is unavailable or changed during preparation",
+                        None,
                     )
                     .await;
                     continue;
@@ -4283,6 +4397,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     &result,
                     false,
                     "Provider environment bindings failed validation",
+                    None,
                 )
                 .await;
                 continue;
@@ -4516,7 +4631,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         }
 
         if policy_runtime_changed && !policy_runtime_reconciled {
-            report_runtime_configuration(&ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed").await;
+            report_runtime_configuration(&ctx, &result, false, "Effective configuration failed runtime preparation; prior credentials remain installed", None).await;
             continue;
         }
         if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
@@ -4589,7 +4704,15 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             skills::install_static_skills,
         );
 
-        if !report_runtime_configuration(&ctx, &result, true, "").await {
+        if !report_runtime_configuration(
+            &ctx,
+            &result,
+            true,
+            "",
+            current_policy_generation.as_ref(),
+        )
+        .await
+        {
             // Retry the exact status tuple on the next poll before advancing
             // the observed revision; an old instance cannot claim readiness.
             continue;
@@ -5308,6 +5431,7 @@ network_policies:
             snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
             state: openshell_core::proto::ConfigurationAdmissionState,
             _error: &str,
+            _loaded_enforcement: Option<openshell_core::proto::LoadedEnforcementEvidence>,
         ) -> Result<()> {
             use openshell_core::proto::ConfigurationAdmissionState;
             if let Some(code) = self.report_error {
@@ -5480,6 +5604,59 @@ network_policies:
                 "snapshot unavailable"
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn withheld_unsupported_configuration_cannot_return_startup_launch_bundle() {
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        let mut withheld = settings_poll_result(None, 0, PolicySource::Unspecified);
+        withheld.configuration_admitted = false;
+        withheld.configuration_error = "Supervisor lacks required enforcement support".into();
+        let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let gateway = TestStartupGateway {
+            desired: Arc::new(std::sync::Mutex::new(withheld)),
+            reports,
+            reject_next_accept: Arc::new(AtomicBool::new(false)),
+            snapshot_error: None,
+            report_error: None,
+            pending_snapshot: false,
+            pending_acceptance: false,
+        };
+        let handle = tokio::spawn(async move {
+            load_policy_with_gateway(
+                Some("sandbox-id".into()),
+                Some("sandbox".into()),
+                Some("http://unused.invalid".into()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            )
+            .await
+        });
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Pending)
+        );
+        assert_eq!(
+            reported.recv().await,
+            Some(ConfigurationAdmissionState::Rejected)
+        );
+        assert!(
+            !handle.is_finished(),
+            "no policy bytes means no fallback workload launch"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(5), reported.recv())
+                .await
+                .unwrap(),
+            Some(ConfigurationAdmissionState::Rejected)
+        );
+        assert!(!handle.is_finished());
+        handle.abort();
+        assert!(matches!(handle.await, Err(error) if error.is_cancelled()));
     }
 
     #[tokio::test]

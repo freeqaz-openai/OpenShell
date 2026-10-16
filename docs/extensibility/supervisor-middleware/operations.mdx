@@ -16,6 +16,7 @@ A middleware service handles one or more operations, such as HTTP requests or We
 | --- | --- | --- | --- |
 | `HTTP_REQUEST` | `PRE_CREDENTIALS` | After network policy allows a request, before OpenShell injects provider credentials. | `EvaluateHttpRequest` |
 | `HTTP_RESPONSE` | `PRE_RETURN` | After the external service responds, before the sandbox receives the response. | `HttpResponsePreReturn.Evaluate` |
+| `HTTP_CREDENTIALS` | `PRE_CREDENTIALS` | After request transformations, when policy explicitly selects an external STATIC credential authority. | `HttpInstallationExchange.Exchange` |
 | `WEBSOCKET_MESSAGE` | `PRE_CREDENTIALS` | When the sandbox opens a WebSocket connection, and for each text message it sends. | `EvaluateWebSocketSession` |
 
 Your service declares each operation it supports as a binding, an operation and its phase, in its `Describe` manifest. OpenShell calls your service only for the operations it declares.
@@ -28,7 +29,7 @@ Every operation includes a request context. The context always includes `sandbox
 
 Operations that include headers deliver them in wire order, and repeated headers stay separate. OpenShell removes credential, routing, and hop-by-hop headers before sending them to your service. It also removes framing headers from request input. Response preflight retains upstream `Content-Length`, `Content-Encoding`, and `Content-Range` as read-only metadata, unless `Connection` names them as hop-by-hop headers. Your service cannot change or remove these fields; OpenShell handles downstream framing.
 
-Every result can include an optional reason code, findings, and metadata:
+Ordinary request, response, and message results can include an optional reason code, findings, and metadata:
 
 - A reason code identifies why your service denied traffic. OpenShell includes it in logs and in HTTP error responses. It must be 1-64 bytes long, start with a lowercase ASCII letter, and contain only lowercase ASCII letters, digits, and underscores. OpenShell treats an invalid code as a middleware failure.
 - Findings report what your service detected, even when it allows the traffic. OpenShell logs how many findings your service reported, not their text.
@@ -39,6 +40,104 @@ OpenShell never forwards free-form text from your service to the sandbox or to l
 ## HTTP
 
 HTTP middleware can check a request before it leaves the sandbox, and the response before the sandbox receives it. A service can support either operation or both.
+
+### External static credentials
+
+This is an experimental protocol for design review. An external authority
+decides whether a supervisor may use a credential for one HTTP operation,
+whether it may start sending that request now, and which response it may return.
+The authority owns credential issuance, scope, rotation, and provider-specific
+policy. Ordinary request middleware cannot authorize a protected send.
+
+Select `credential_authority: true`, a single literal host with no exclusions,
+and `on_error: fail_closed`. The authority must use authenticated HTTPS and
+advertise both `HTTP_CREDENTIALS/PRE_CREDENTIALS` and `HTTP_RESPONSE/PRE_RETURN`.
+It must support and require the policy's complete enforcement profile:
+
+- With `credential_connectors`, pin 1–64 canonical absolute executable paths and
+  their SHA-256 hashes. The verified connecting executable must match a complete
+  pair. This profile requires `http-credential-access.v1`,
+  `http-credential-verified-connector.v1`, `installation-exchange.v1`, and
+  `response-custody.v1`, under `openshell.supervisor-middleware.`.
+- A new policy can instead grant `execution_authority: true`, which explicitly
+  shares access among processes in the workload. This replaces the verified
+  connector capability with `execution-authority.v1` and
+  `protected-no-material.v1`. Missing or unusable credentials never select
+  the no-credential case. Both profiles require a trusted, mediated workload
+  connect; neither an explicit CONNECT nor a claimed executable path suffices.
+
+For each protected operation, the supervisor:
+
+1. Verifies upstream TLS and keeps the accepted workload stream. After request
+   transformations it removes incoming credentials and control headers. This
+   prototype strips all workload-supplied `X-` headers on the protected path.
+2. Opens one bidirectional installation exchange. It signs the authority's fresh
+   challenge and the exact resolve request with the key enrolled for its
+   installation. The authority verifies the signature, authenticated instance,
+   current loaded enforcement, and policy before providing selected credentials
+   or an explicit decision that no provider credential is required.
+3. Asks again immediately before sending. The permit binds the operation,
+   credential selection, response stream commitment, and latest allowed send
+   start. The supervisor rechecks local policy and starts at most one send.
+4. Receives the response through its final trailers. On the same exchange it
+   submits status, safe headers, decoded body, and trailers, and waits for an
+   explicitly complete approved response and successful terminal status. It
+   checks for literal selected-credential echoes and releases the result only
+   on the workload stream it still holds.
+
+The initial path supports bounded HTTPS over HTTP/1 and the credential headers
+`authorization`, `x-api-key`, and `api-key`. The response limit is 4 MiB,
+including framing. The request UUIDv7 creation time fixes a 30-second operation
+horizon; an earlier deadline may shorten it. Finite event streams are buffered,
+not streamed live. Compression, upgrades, request signing, credential-bearing
+body rewrites, and MCP mirrors are unsupported.
+
+A policy decision can race revocation. An interrupted send may have reached the
+provider; the supervisor does not retry it. Installation key possession is not
+process or binary attestation. Integrators must separately qualify enforcement,
+containment, and exclusion of workload access to supervisor credentials.
+
+#### Loaded enforcement evidence
+
+`GetSandboxPolicyStatus.loaded_enforcement` reports the capabilities that the
+actual supervisor validated after installing its policy and middleware registry.
+The receipt binds the immutable sandbox ID, configuration registration instance,
+exact policy version/hash, configuration revision (including registered services),
+and provider environment revision. The gateway accepts it only from the sandbox
+principal for the current registration and effective configuration. The required
+capabilities are those of the complete enforcement profile above.
+Protected configuration acceptance requires this evidence. An old supervisor's
+`LOADED` report, cached manifest or gateway capability advertisement is insufficient.
+
+Supervisors declare implementation support in
+`GetSandboxConfigRequest.supported_enforcement_capabilities` before receiving a
+protected policy. Sandbox callers that omit the required capability receive the
+existing configuration-error response without policy bytes or service registrations.
+This prevents missing-capability clients from receiving protected policy bytes. Operator
+configuration inspection remains available. The declaration only gates delivery;
+it does not replace the post-installation receipt. The supported initial path uses
+a fresh sandbox with matching gateway and supervisor; mixed-version hot activation
+requires separate installed qualification.
+
+Read current evidence when admitting an operation and recheck it at final
+authorization. Require the exact admitted policy/configuration and capability;
+an absent or mismatched receipt refuses readiness. Replacement registration,
+failed/rejected loads and changed effective configuration invalidate the
+observation. It is not a continuation lease or an authorization decision.
+The admission object stored in sandbox status is historical; use the current
+policy-status query for readiness. Configuration changes propagate through
+supervisor polling, so a configuration update is not an instantaneous network fence.
+Global status queries carry no sandbox receipt. If a global override differs from
+the queried sandbox revision, that sandbox query also refuses evidence.
+The supervisor supplies its own successfully registered startup UUID when requesting
+extension credentials. The gateway checks current registration under its mutation
+fence before signing `instance_id`; it never substitutes a newer UUID for a stale
+caller. Pending registration can obtain credentials needed for registry installation,
+but only accepted loaded evidence qualifies activation. This claim identifies a
+validated registration, not an attested process or binary. A malicious trusted
+supervisor holding sandbox credentials is outside this guarantee. Network isolation,
+Agent exclusion from those credentials/APIs, and installed runtime qualification
+remain required.
 
 ### Requests
 

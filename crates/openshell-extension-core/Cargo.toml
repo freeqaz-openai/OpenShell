@@ -11,6 +11,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aws-lc-rs = { workspace = true }
+uuid = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }

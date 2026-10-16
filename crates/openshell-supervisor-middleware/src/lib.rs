@@ -3,6 +3,7 @@
 
 //! Supervisor middleware registration and chain execution.
 
+pub mod credentials;
 pub mod headers;
 mod remote;
 mod response;
@@ -362,6 +363,8 @@ impl OnError {
 
 #[derive(Debug, Clone)]
 pub struct ChainEntry {
+    pub credential_authority: bool,
+    pub execution_authority: bool,
     pub name: String,
     pub implementation: String,
     pub order: i32,
@@ -384,6 +387,8 @@ impl TryFrom<(&str, &NetworkMiddlewareConfig)> for ChainEntry {
         }
         Ok(Self {
             name: name.to_string(),
+            credential_authority: value.credential_authority,
+            execution_authority: value.execution_authority,
             implementation: value.middleware.clone(),
             order: value.order,
             config: value.config.clone().unwrap_or_default(),
@@ -654,6 +659,8 @@ impl MiddlewareDispatch {
 }
 
 struct MiddlewareServiceState {
+    /// Present only for an authenticated HTTPS registration.
+    credential_audience: Option<String>,
     /// Policy-facing built-in name or operator-owned registration name. The
     /// single-service test constructor leaves this empty and uses the manifest
     /// name after Describe.
@@ -862,6 +869,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
+    HttpCredentials,
     HttpPreCredentials,
     HttpResponsePreReturn,
     WebSocketPreCredentials,
@@ -872,6 +880,10 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
         SupervisorMiddlewareOperation::try_from(binding.operation).ok(),
         SupervisorMiddlewarePhase::try_from(binding.phase).ok(),
     ) {
+        (
+            Some(SupervisorMiddlewareOperation::HttpCredentials),
+            Some(SupervisorMiddlewarePhase::PreCredentials),
+        ) => Ok(SupportedBinding::HttpCredentials),
         (
             Some(SupervisorMiddlewareOperation::HttpRequest),
             Some(SupervisorMiddlewarePhase::PreCredentials),
@@ -1178,6 +1190,7 @@ impl MiddlewareRegistry {
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(attachment_name),
+                credential_audience: None,
                 service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
@@ -1258,6 +1271,11 @@ impl MiddlewareRegistry {
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
                 attachment_name: Some(registration.name.clone()),
+                credential_audience: (authenticated
+                    && !registration.allow_insecure_transport
+                    && registration.grpc_endpoint.starts_with("https://")
+                    && !registration.audience.is_empty())
+                .then(|| registration.audience.clone()),
                 service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
@@ -1283,6 +1301,11 @@ impl MiddlewareRegistry {
         ensure_config_capacity(policy.network_middlewares.len())?;
         let runner = ChainRunner::from_registry(self.clone());
         for (name, config) in &policy.network_middlewares {
+            if config.credential_authority {
+                runner
+                    .credential_authority_policy(&[ChainEntry::try_from((name.as_str(), config))?])
+                    .await?;
+            }
             runner
                 .validate_config(
                     &config.middleware,
@@ -1364,6 +1387,7 @@ impl ChainRunner {
         Self {
             registry: Arc::new(MiddlewareRegistry {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
+                    credential_audience: None,
                     attachment_name: None,
                     service,
                     manifest: OnceCell::new(),
@@ -1703,6 +1727,7 @@ impl ChainRunner {
         // borrow these values for every stage; only the gRPC adapter clones them
         // when an operator service requires an owned protobuf message.
         let context = RequestContext {
+            verified_credential_connector: None,
             request_id,
             sandbox_id,
             sandbox: sandbox_name,
@@ -2151,6 +2176,8 @@ mod tests {
 
     fn entry(name: &str, on_error: OnError) -> ChainEntry {
         ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: name.into(),
             implementation: BUILTIN_REGEX.into(),
             order: 0,
@@ -2290,6 +2317,8 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "first".into(),
                 implementation: "acme/redactor".into(),
                 order: 0,
@@ -2297,6 +2326,8 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "second".into(),
                 implementation: "acme/redactor".into(),
                 order: 10,
@@ -2426,6 +2457,8 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "replace".into(),
                 implementation: "test/replacement-transfer".into(),
                 order: 0,
@@ -2433,6 +2466,8 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "observe".into(),
                 implementation: "test/replacement-transfer".into(),
                 order: 10,
@@ -2504,6 +2539,8 @@ mod tests {
     async fn in_process_evaluation_remains_interruptible_by_stage_timeout() {
         let runner = ChainRunner::new(Arc::new(PendingInProcessService));
         let entry = |on_error| ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "pending".into(),
             implementation: "test/pending".into(),
             order: 0,
@@ -2634,6 +2671,8 @@ mod tests {
     #[tokio::test]
     async fn fail_open_allows_unavailable_middleware() {
         let unavailable = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -2651,6 +2690,8 @@ mod tests {
     #[tokio::test]
     async fn fail_closed_denies_unavailable_middleware() {
         let unavailable = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 0,
@@ -2945,6 +2986,8 @@ mod tests {
         });
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "transform".into(),
             implementation: "test/two-stage".into(),
             order: 0,
@@ -2960,6 +3003,8 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "second".into(),
             implementation: "test/two-stage".into(),
             order: 10,
@@ -3007,6 +3052,8 @@ mod tests {
         });
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let transform = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "transform".into(),
             implementation: "test/two-stage".into(),
             order: 0,
@@ -3022,6 +3069,8 @@ mod tests {
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "second".into(),
             implementation: "test/two-stage".into(),
             order: 10,
@@ -3060,6 +3109,8 @@ mod tests {
         let runner = ChainRunner::new_protobuf_for_tests(service);
         let entries = [
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "transform".into(),
                 implementation: "test/two-stage".into(),
                 order: 0,
@@ -3075,6 +3126,8 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "second".into(),
                 implementation: "test/two-stage".into(),
                 order: 10,
@@ -3356,6 +3409,8 @@ mod tests {
             let runner = ChainRunner::new_protobuf_for_tests(service.clone());
             let entries = [
                 ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "first".into(),
                     implementation: "test/header-chain".into(),
                     order: 0,
@@ -3363,6 +3418,8 @@ mod tests {
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "second".into(),
                     implementation: "test/header-chain".into(),
                     order: 10,
@@ -3370,6 +3427,8 @@ mod tests {
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "observer".into(),
                     implementation: "test/header-chain".into(),
                     order: 20,
@@ -3402,6 +3461,8 @@ mod tests {
         let runner = ChainRunner::new(service.clone());
         let entries = [
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "writer".into(),
                 implementation: "test/in-process-header-chain".into(),
                 order: 0,
@@ -3409,6 +3470,8 @@ mod tests {
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "observer".into(),
                 implementation: "test/in-process-header-chain".into(),
                 order: 10,
@@ -3472,6 +3535,8 @@ mod tests {
             .collect(),
         };
         let recorder_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "recorder".into(),
             implementation: "test/recorder".into(),
             order: 0,
@@ -3581,6 +3646,7 @@ mod tests {
         MiddlewareRegistry {
             services: Arc::new(vec![
                 Arc::new(MiddlewareServiceState {
+                    credential_audience: None,
                     attachment_name: Some(builtin_name.clone()),
                     service: MiddlewareDispatch::InProcess(builtin_service),
                     manifest: builtin_manifest_cell,
@@ -3589,6 +3655,7 @@ mod tests {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 }),
                 Arc::new(MiddlewareServiceState {
+                    credential_audience: None,
                     attachment_name: Some(registration_name.clone()),
                     service: MiddlewareDispatch::Grpc(remote::GrpcMiddlewareService::from_service(
                         Arc::new(GeneratedMiddlewareEndpoint { service }),
@@ -3611,6 +3678,8 @@ mod tests {
     #[tokio::test]
     async fn describe_chain_marks_resolved_and_unresolved_entries() {
         let unresolved = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "missing".into(),
             implementation: "third-party/missing".into(),
             order: 10,
@@ -3636,6 +3705,8 @@ mod tests {
             result: allow_result(),
         }));
         let entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "external".into(),
             implementation: "test/middleware".into(),
             order: 0,
@@ -3674,6 +3745,8 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let external_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "external".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -3714,6 +3787,8 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "guard".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -3757,6 +3832,8 @@ mod tests {
         let registry = registry_with_external(external, external_registration(1024)).await;
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "guard".into(),
             implementation: "local-guard-service".into(),
             order: 10,
@@ -4080,6 +4157,8 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = |on_error| ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4122,6 +4201,8 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4160,6 +4241,8 @@ mod tests {
         .await;
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "slow".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -4224,6 +4307,9 @@ mod tests {
             network_middlewares: HashMap::from([(
                 "guard".into(),
                 NetworkMiddlewareConfig {
+                    credential_connectors: Vec::new(),
+                    credential_authority: false,
+                    execution_authority: false,
                     name: String::new(),
                     middleware: "local-guard-service".into(),
                     order: 0,
@@ -4248,6 +4334,8 @@ mod tests {
             .evaluate(
                 &[
                     ChainEntry {
+                        credential_authority: false,
+                        execution_authority: false,
                         name: "primary".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4255,6 +4343,8 @@ mod tests {
                         on_error: OnError::FailClosed,
                     },
                     ChainEntry {
+                        credential_authority: false,
+                        execution_authority: false,
                         name: "secondary".into(),
                         implementation: "secondary-guard-service".into(),
                         order: 10,
@@ -4354,6 +4444,8 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4411,6 +4503,8 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4487,6 +4581,8 @@ mod tests {
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "guard".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,
@@ -4529,6 +4625,8 @@ mod tests {
             let outcome = runner
                 .evaluate(
                     &[ChainEntry {
+                        credential_authority: false,
+                        execution_authority: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4587,6 +4685,8 @@ mod tests {
             let outcome = ChainRunner::from_registry(registry)
                 .evaluate(
                     &[ChainEntry {
+                        credential_authority: false,
+                        execution_authority: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4624,6 +4724,8 @@ mod tests {
             let outcome = runner
                 .evaluate(
                     &[ChainEntry {
+                        credential_authority: false,
+                        execution_authority: false,
                         name: "guard".into(),
                         implementation: "local-guard-service".into(),
                         order: 0,
@@ -4669,6 +4771,8 @@ mod tests {
         }));
         let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
             .map(|index| ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: format!("guard-{index}"),
                 implementation: "test/middleware".into(),
                 order: i32::try_from(index).expect("bounded stage index"),
@@ -5224,6 +5328,8 @@ mod tests {
         on_error: OnError,
     ) -> ChainEntry {
         ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: name.into(),
             implementation: implementation.into(),
             order,
@@ -5261,6 +5367,8 @@ mod tests {
                 result: allow_result(),
             }));
             let chain = [ChainEntry {
+                credential_authority: false,
+                execution_authority: false,
                 name: "http-guard".into(),
                 implementation: "test/http-only".into(),
                 order: 0,
@@ -5302,6 +5410,8 @@ mod tests {
             result: allow_result(),
         }));
         let chain = [ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "http-guard".into(),
             implementation: "test/http-only".into(),
             order: 0,
@@ -5663,6 +5773,8 @@ mod tests {
         let service = OpenAiRedactionService::default();
         let runner = ChainRunner::from_endpoint(Arc::new(service));
         let chain = [ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "openai-redactor".into(),
             implementation: "test/openai-websocket-redactor".into(),
             order: 0,
@@ -5727,6 +5839,8 @@ mod tests {
             .expect("connect WebSocket middleware");
         let runner = ChainRunner::from_registry(registry);
         let chain = [ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "openai-redactor".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -5822,6 +5936,8 @@ mod tests {
             .expect("connect WebSocket middleware");
         let runner = ChainRunner::from_registry(registry);
         let chain = [ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "openai-redactor".into(),
             implementation: "local-guard-service".into(),
             order: 0,
@@ -5920,6 +6036,8 @@ mod tests {
                 .expect("connect mixed middleware services"),
         );
         let broken_entry = ChainEntry {
+            credential_authority: false,
+            execution_authority: false,
             name: "best-effort-remote".into(),
             implementation: "test/openai-websocket-redactor".into(),
             order: 0,
@@ -6122,6 +6240,8 @@ mod tests {
         let result = runner
             .preflight_websocket(
                 &[ChainEntry {
+                    credential_authority: false,
+                    execution_authority: false,
                     name: "scope".into(),
                     implementation: "local-guard-service".into(),
                     order: 0,

@@ -128,12 +128,21 @@ mod tests {
     // the additive file map while retaining the rest of the response.
     // Service authorization also extends both schemas additively. Legacy
     // payloads retain the safe Strip default.
+    // The middleware credential-authority opt-in is additive: prior policy
+    // payloads decode false and require no storage rewrite. Protected installs
+    // must independently negotiate the new extension capability.
+    // LoadedEnforcementEvidence is additive to the durable admission. Prior
+    // accepted admissions decode with no evidence and never qualify a protected
+    // installation. The frozen storage.v1 closure itself is unchanged.
+    // CredentialConnector is an additive public/durable policy child. Empty
+    // old pins still decode, but cannot activate protected policy. The verified
+    // request proof belongs only to the supervisor-extension protocol closure.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "2e156c6ad3c8eb51bcd30dc13b173fe339b38207a1b1f98f7be2e0cad8e3bd45";
+        "15dc041eea0577c329abfd7e4e86906238efc389a308354d22d419e6a8007f54";
     const DURABLE_SCHEMA_SHA256: &str =
-        "38165d9d76f49fcfe98a12f241e032838a2376c1d1a87ea2796fd33b9b1a3541";
+        "7ba9f749d2859552c5152abf79ee560c14d906bf7158d9b3e6cc02af6f5a678a";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "47244e0e14a2815f014e9d85917ea318fabcf3f3f6f2bc26c134181fd3ce62bb";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -487,6 +496,56 @@ mod tests {
     }
 
     #[test]
+    fn prior_middleware_policy_does_not_opt_into_credential_authority() {
+        use openshell_core::proto::NetworkMiddlewareConfig;
+
+        // Prior wire payload: field 2 (middleware) = "test/authority".
+        let prior = NetworkMiddlewareConfig::decode(&b"\x12\x0etest/authority"[..]).unwrap();
+        assert_eq!(prior.middleware, "test/authority");
+        assert!(!prior.credential_authority);
+    }
+
+    #[test]
+    fn prior_accepted_admission_has_no_enforcement_evidence() {
+        // Independently fixed pre-field-8 wire payload: instance=old, ACCEPTED,
+        // version=1, hash=hash, config=7, provider_env=9.
+        let bytes = b"\x0a\x03old\x10\x02\x18\x01\x22\x04hash\x28\x07\x30\x09";
+        let admission =
+            openshell_core::proto::SandboxConfigurationAdmission::decode(bytes.as_slice()).unwrap();
+        assert_eq!(admission.instance_id, "old");
+        assert_eq!(
+            admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Accepted)
+        );
+        assert_eq!(
+            (
+                admission.policy_version,
+                admission.config_revision,
+                admission.provider_env_revision
+            ),
+            (1, 7, 9)
+        );
+        assert!(admission.loaded_enforcement.is_none());
+    }
+
+    #[test]
+    fn prior_credential_messages_decode_without_connector_authority() {
+        // Pre-connector config: middleware="old", credential_authority=true.
+        let config = openshell_core::proto::NetworkMiddlewareConfig::decode(
+            b"\x12\x03old\x38\x01".as_slice(),
+        )
+        .unwrap();
+        assert_eq!(config.middleware, "old");
+        assert!(config.credential_authority);
+        assert!(config.credential_connectors.is_empty());
+        // Prior request context carries a request id but no verified leaf proof.
+        let context =
+            openshell_core::proto::RequestContext::decode(b"\x0a\x03old".as_slice()).unwrap();
+        assert_eq!(context.request_id, "old");
+        assert!(context.verified_credential_connector.is_none());
+    }
+
+    #[test]
     fn public_and_durable_schema_inventories_are_complete() {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
@@ -541,7 +600,9 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            102 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            // HttpCredentialAccess adds two trusted supervisor-to-extension
+            // methods; neither is a public gateway or storage RPC.
+            104 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
@@ -598,9 +659,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (306, 27),
-                (93, 21),
-                (81, 21),
+                (309, 27),
+                (95, 21),
+                (83, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

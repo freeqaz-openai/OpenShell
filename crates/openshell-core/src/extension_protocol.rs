@@ -11,6 +11,42 @@ use crate::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 
 pub const PROTOCOL_MAJOR: u32 = 1;
 pub const PROTOCOL_MINOR: u32 = 0;
+pub const HTTP_CREDENTIAL_ACCESS_CAPABILITY: &str =
+    "openshell.supervisor-middleware.http-credential-access.v1";
+
+pub const HTTP_CREDENTIAL_VERIFIED_CONNECTOR_CAPABILITY: &str =
+    "openshell.supervisor-middleware.http-credential-verified-connector.v1";
+pub const HTTP_INSTALLATION_EXCHANGE_CAPABILITY: &str =
+    "openshell.supervisor-middleware.installation-exchange.v1";
+pub const HTTP_RESPONSE_CUSTODY_CAPABILITY: &str =
+    "openshell.supervisor-middleware.response-custody.v1";
+pub const HTTP_CREDENTIAL_REQUIRED_CAPABILITIES: [&str; 4] = [
+    HTTP_CREDENTIAL_ACCESS_CAPABILITY,
+    HTTP_CREDENTIAL_VERIFIED_CONNECTOR_CAPABILITY,
+    HTTP_INSTALLATION_EXCHANGE_CAPABILITY,
+    HTTP_RESPONSE_CUSTODY_CAPABILITY,
+];
+
+pub const HTTP_EXECUTION_AUTHORITY_CAPABILITY: &str =
+    "openshell.supervisor-middleware.execution-authority.v1";
+
+pub const HTTP_PROTECTED_NO_MATERIAL_CAPABILITY: &str =
+    "openshell.supervisor-middleware.protected-no-material.v1";
+
+/// The enforcement profile of an explicit policy grant, in canonical evidence order.
+pub const fn credential_enforcement_profile(execution_authority: bool) -> &'static [&'static str] {
+    if execution_authority {
+        &[
+            HTTP_CREDENTIAL_ACCESS_CAPABILITY,
+            HTTP_INSTALLATION_EXCHANGE_CAPABILITY,
+            HTTP_RESPONSE_CUSTODY_CAPABILITY,
+            HTTP_EXECUTION_AUTHORITY_CAPABILITY,
+            HTTP_PROTECTED_NO_MATERIAL_CAPABILITY,
+        ]
+    } else {
+        &HTTP_CREDENTIAL_REQUIRED_CAPABILITIES
+    }
+}
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -103,6 +139,12 @@ pub enum NegotiationError {
 #[must_use]
 pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let contract = family.contract_capability();
+    let mut supported_capabilities = vec![contract.clone()];
+    if family == ExtensionFamily::SupervisorMiddleware {
+        supported_capabilities.extend(HTTP_CREDENTIAL_REQUIRED_CAPABILITIES.map(str::to_string));
+        supported_capabilities.push(HTTP_EXECUTION_AUTHORITY_CAPABILITY.to_string());
+        supported_capabilities.push(HTTP_PROTECTED_NO_MATERIAL_CAPABILITY.to_string());
+    }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
             major: PROTOCOL_MAJOR,
@@ -110,7 +152,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         }),
         implementation_name: "openshell/gateway".to_string(),
         implementation_version: crate::VERSION.to_string(),
-        supported_capabilities: vec![contract.clone()],
+        supported_capabilities,
         required_capabilities: vec![contract],
     }
 }

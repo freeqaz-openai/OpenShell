@@ -11,6 +11,8 @@ pub const DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT: std::time::Duration =
 
 /// Context retained from request evaluation for the matching response hook.
 pub struct HttpResponseMiddlewareRelay<'a> {
+    pub(crate) credential_connection: Option<&'a crate::opa::CredentialConnection>,
+    pub(crate) upstream_transport: crate::l7::tls::UpstreamTransport,
     pub(crate) chain: &'a [openshell_supervisor_middleware::ChainEntry],
     pub(crate) runner: &'a openshell_supervisor_middleware::ChainRunner,
     pub(crate) request_context: RequestContext,
@@ -51,61 +53,30 @@ where
     C: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1024];
-
-    // Forward interim responses unchanged, but retain the final response head
-    // until response middleware preflight completes.
-    let mut informational_header_bytes = 0;
-    let header_end = loop {
-        let header_end = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|end| end + 4);
-        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
-        if header_end.is_some_and(|end| end > remaining_header_bytes)
-            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
-        {
-            if let Some(observer) = options.observer.as_ref() {
-                observer.observe(EndpointResult::TransportFailed);
-            }
-            return Err(miette!("HTTP response headers exceed limit"));
-        }
-
-        if let Some(header_end) = header_end {
-            let header_str = String::from_utf8_lossy(&buf[..header_end]);
-            if matches!(
-                parse_observed_http_status_code(&header_str),
-                Some(100 | 102..=199)
-            ) {
-                informational_header_bytes += header_end;
-                client
-                    .write_all(&buf[..header_end])
-                    .await
-                    .into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
-                buf.drain(..header_end);
-                continue;
-            }
-            break header_end;
-        }
-
-        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
-        if n == 0 {
-            if let Some(observer) = options.observer.as_ref() {
-                observer.observe(EndpointResult::TransportFailed);
-            }
-            if !buf.is_empty() {
-                client.write_all(&buf).await.into_diagnostic()?;
-            }
-            return Ok(RelayOutcome::Consumed);
-        }
-        buf.extend_from_slice(&tmp[..n]);
+    let protected = response_middleware.as_ref().is_some_and(|middleware| {
+        openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain)
+    });
+    let Some((buf, header_end)) =
+        read_final_response_head(upstream, client, protected, options.observer).await?
+    else {
+        return Ok(RelayOutcome::Consumed);
     };
 
     // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let observed_status = parse_observed_http_status_code(&header_str);
+    if protected
+        && (observed_status.is_none()
+            || observed_status == Some(101)
+            || header_str.lines().skip(1).any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-encoding")
+                        && !value.trim().eq_ignore_ascii_case("identity")
+                })
+            }))
+    {
+        return Err(miette!("unsupported protected response"));
+    }
     if let Some(observer) = options.observer.as_ref() {
         match observed_status {
             Some(status_code) if status_code < 400 => {
@@ -263,6 +234,258 @@ where
     finish_response(client, server_wants_close || http_10_closes_by_default).await
 }
 
+/// Read through the final status and header block. No interim response is released for custody.
+async fn read_final_response_head(
+    upstream: &mut (impl AsyncRead + Unpin),
+    client: &mut (impl AsyncWrite + Unpin),
+    protected: bool,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<(Vec<u8>, usize)>> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+
+    // Forward interim responses unchanged, but retain the final response head
+    // until response middleware preflight completes.
+    let mut informational_header_bytes = 0;
+    let header_end = loop {
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|end| end + 4);
+        let remaining_header_bytes = MAX_HEADER_BYTES - informational_header_bytes;
+        if header_end.is_some_and(|end| end > remaining_header_bytes)
+            || (header_end.is_none() && buf.len() >= remaining_header_bytes)
+        {
+            if let Some(observer) = observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            return Err(miette!("HTTP response headers exceed limit"));
+        }
+
+        if let Some(header_end) = header_end {
+            if protected {
+                // Validate even interim status lines before interpreting them.
+                response_status_line(&buf[..header_end], true)?;
+            }
+            let header_str = String::from_utf8_lossy(&buf[..header_end]);
+            if matches!(
+                parse_observed_http_status_code(&header_str),
+                Some(100 | 102..=199)
+            ) {
+                informational_header_bytes += header_end;
+                if protected {
+                    // Interim fields have no response-policy evaluation. Do not
+                    // expose them on a protected exchange.
+                    buf.drain(..header_end);
+                    continue;
+                }
+                client
+                    .write_all(&buf[..header_end])
+                    .await
+                    .into_diagnostic()?;
+                client.flush().await.into_diagnostic()?;
+                buf.drain(..header_end);
+                continue;
+            }
+            break header_end;
+        }
+
+        let n = upstream.read(&mut tmp).await.into_diagnostic()?;
+        if n == 0 {
+            if protected {
+                return Err(miette!("protected response ended before complete headers"));
+            }
+            if let Some(observer) = observer {
+                observer.observe(EndpointResult::TransportFailed);
+            }
+            if !buf.is_empty() {
+                client.write_all(&buf).await.into_diagnostic()?;
+            }
+            return Ok(None);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+
+    Ok(Some((buf, header_end)))
+}
+
+/// Capture all response semantics, including the terminating trailer block, before policy.
+pub(super) async fn capture_custody_response(
+    upstream: &mut (impl AsyncRead + Unpin),
+    method: &str,
+    body_limit: usize,
+    observer: Option<&EndpointObserver>,
+) -> Result<(String, openshell_core::proto::InstallationExchangeResponse)> {
+    let (buffered, end) =
+        read_final_response_head(upstream, &mut tokio::io::sink(), true, observer)
+            .await?
+            .ok_or_else(|| miette!("missing protected response"))?;
+    let head = &buffered[..end];
+    let status_line = response_status_line(head, true)?;
+    let text = std::str::from_utf8(head)
+        .map_err(|_| miette!("invalid protected response header encoding"))?;
+    let status = parse_observed_http_status_code(text)
+        .filter(|code| *code >= 200 && *code < 600)
+        .ok_or_else(|| miette!("invalid final protected response status"))?;
+    if let Some(observer) = observer {
+        observer.observe(if status < 400 {
+            EndpointResult::HttpResponseReceived
+        } else {
+            EndpointResult::UpstreamRejected
+        });
+    }
+    let parsed = parse_response_head_for_middleware(head)?;
+    let (mut body, mut trailers) = (Vec::new(), Vec::new());
+    let headers: Vec<_> = parsed
+        .headers
+        .into_iter()
+        .filter(|h| !custody_private_field(&h.name))
+        .collect();
+    // Check on the original head even when an origin nominates Content-Encoding as hop-by-hop.
+    if text
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.trim().eq_ignore_ascii_case("identity")
+        })
+    {
+        return Err(miette!("unsupported protected response encoding"));
+    }
+    if !method.eq_ignore_ascii_case("HEAD") && !matches!(status, 204 | 304) {
+        let mut reader = BufferedResponseReader::new(upstream, &buffered[end..]);
+        match parse_body_length(text)? {
+            BodyLength::ContentLength(length) => {
+                let length = usize::try_from(length)
+                    .ok()
+                    .filter(|len| *len <= body_limit)
+                    .ok_or_else(|| miette!("protected response exceeds limit"))?;
+                body = reader.read_exact_vec(length).await?;
+            }
+            BodyLength::None => {
+                while let Some(chunk) = reader.read_some(8192).await? {
+                    if body.len() + chunk.len() > body_limit {
+                        return Err(miette!("protected response exceeds limit"));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+            }
+            BodyLength::Chunked => {
+                loop {
+                    let line = reader.read_line().await?;
+                    let size = line
+                        .split(|b| *b == b';')
+                        .next()
+                        .and_then(|hex| {
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return None;
+                            }
+                            usize::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
+                        })
+                        .filter(|n| *n <= body_limit - body.len())
+                        .ok_or_else(|| miette!("invalid or oversized protected response chunk"))?;
+                    if size == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&reader.read_exact_vec(size).await?);
+                    if reader.read_exact_vec(2).await? != b"\r\n" {
+                        return Err(miette!("invalid protected response chunk terminator"));
+                    }
+                }
+                let mut bytes = 0;
+                loop {
+                    let line = reader.read_line().await?;
+                    bytes += line.len() + 2;
+                    if bytes > MAX_HEADER_BYTES {
+                        return Err(miette!("protected response trailers exceed limit"));
+                    }
+                    if line.is_empty() {
+                        break;
+                    }
+                    let h = parse_response_trailer(&line, &parsed.connection_nominated)?;
+                    if custody_private_field(&h.name)
+                        || trailers.len() >= openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS
+                    {
+                        return Err(miette!("invalid protected response trailers"));
+                    }
+                    trailers.push(h);
+                }
+            }
+        }
+    }
+    Ok((
+        status_line,
+        openshell_core::proto::InstallationExchangeResponse {
+            status: status.into(),
+            headers,
+            body,
+            trailers,
+            response_complete: true,
+        },
+    ))
+}
+
+fn custody_private_field(name: &str) -> bool {
+    is_protected_response_field(name)
+        || openshell_supervisor_middleware::credentials::is_credential_header(
+            &name.to_ascii_lowercase(),
+        )
+        || name.eq_ignore_ascii_case("cookie")
+}
+
+/// Frame only the complete policy-approved response. Its status line was locally canonicalized.
+pub(super) async fn frame_custody_response(
+    status_line: &str,
+    approved: openshell_core::proto::InstallationExchangeResponse,
+    output: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    if !approved.response_complete
+        || parse_status_code(status_line).map(u32::from) != Some(approved.status)
+    {
+        return Err(miette!("protected response status binding invalid"));
+    }
+    for h in approved.headers.iter().chain(&approved.trailers) {
+        validate_http_field_name(&h.name)?;
+        validate_http_field_value(&h.value)?;
+        if custody_private_field(&h.name)
+            || (h.name.eq_ignore_ascii_case("content-encoding")
+                && !h.value.eq_ignore_ascii_case("identity"))
+        {
+            return Err(miette!("forbidden protected response field"));
+        }
+    }
+    let trailers: Vec<_> = approved.trailers.iter().map(|h| h.name.clone()).collect();
+    let framing = if trailers.is_empty() {
+        ResponseFraming::ContentLength(approved.body.len() as u64)
+    } else {
+        ResponseFraming::Chunked
+    };
+    let head = serialize_response_head(
+        status_line,
+        &approved.headers,
+        &[],
+        framing,
+        true,
+        &trailers,
+    );
+    output.write_all(&head).await.into_diagnostic()?;
+    if trailers.is_empty() {
+        output.write_all(&approved.body).await.into_diagnostic()?;
+    } else {
+        if !approved.body.is_empty() {
+            output
+                .write_all(format!("{:x}\r\n", approved.body.len()).as_bytes())
+                .await
+                .into_diagnostic()?;
+            output.write_all(&approved.body).await.into_diagnostic()?;
+            output.write_all(b"\r\n").await.into_diagnostic()?;
+        }
+        write_response_trailers(output, &approved.trailers).await?;
+    }
+    Ok(())
+}
+
 /// Body framing determines when delivery finishes, not whether another
 /// request is permitted. Signal EOF (including TLS `close_notify`) before the
 /// caller tears down a closing CONNECT tunnel; waiting for another request
@@ -320,7 +543,7 @@ where
     if let Some(guard) = middleware.generation_guard {
         guard.ensure_current()?;
     }
-    let (described, parsed) = match parsed {
+    let (described, mut parsed) = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             debug!(error = %error, "HTTP response head normalization failed");
@@ -340,8 +563,20 @@ where
             return Ok(Some(RelayOutcome::Consumed));
         }
     };
+    if openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain) {
+        parsed.headers.retain(|header| {
+            !openshell_supervisor_middleware::credentials::is_credential_header(&header.name)
+                && header.name != "cookie"
+        });
+    }
     let original_headers = parsed.headers.clone();
-    let preserved_credential_headers = parsed.preserved_credential_headers;
+    let preserved_credential_headers =
+        if openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain)
+        {
+            Vec::new()
+        } else {
+            parsed.preserved_credential_headers
+        };
     let upstream_declared_trailers = parsed.declared_trailers.clone();
     let connection_nominated_headers = parsed.connection_nominated.clone();
     let input = openshell_supervisor_middleware::HttpResponsePreflightInput {
@@ -448,7 +683,12 @@ where
         if preflight.headers == original_headers {
             return Ok(None);
         }
-        let status_line = response_status_line(header_bytes)?;
+        let status_line = response_status_line(
+            header_bytes,
+            openshell_supervisor_middleware::credentials::has_credential_authority(
+                middleware.chain,
+            ),
+        )?;
         let outcome = relay_headers_only_response(
             request_method,
             upstream,
@@ -467,7 +707,10 @@ where
         return Ok(Some(outcome));
     };
 
-    let status_line = response_status_line(header_bytes)?;
+    let status_line = response_status_line(
+        header_bytes,
+        openshell_supervisor_middleware::credentials::has_credential_authority(middleware.chain),
+    )?;
     let supports_chunked_response = !status_line.starts_with("HTTP/1.0 ");
     let bodiless = is_bodiless_response(request_method, status_code);
     if bodiless {
@@ -1226,14 +1469,42 @@ fn is_hidden_response_field(name: &str) -> bool {
     )
 }
 
-fn response_status_line(header_bytes: &[u8]) -> Result<String> {
+fn response_status_line(header_bytes: &[u8], protected: bool) -> Result<String> {
     let line_end = header_bytes
         .windows(2)
         .position(|window| window == b"\r\n")
         .ok_or_else(|| miette!("HTTP response status line is incomplete"))?;
-    std::str::from_utf8(&header_bytes[..line_end])
-        .map(str::to_string)
-        .map_err(|_| miette!("HTTP response status line contains invalid UTF-8"))
+    let line = std::str::from_utf8(&header_bytes[..line_end])
+        .map_err(|_| miette!("HTTP response status line contains invalid UTF-8"))?;
+    if !protected {
+        return Ok(line.to_string());
+    }
+    // Response policy sees numeric status, not the provider's reason phrase.
+    // Validate the wire grammar and emit only locally chosen reason text.
+    if line.chars().any(char::is_control) {
+        return Err(miette!(
+            "protected HTTP response status line contains controls"
+        ));
+    }
+    let (version, rest) = line
+        .split_once(' ')
+        .ok_or_else(|| miette!("malformed protected HTTP response status line"))?;
+    let (code, _) = rest
+        .split_once(' ')
+        .ok_or_else(|| miette!("malformed protected HTTP response status line"))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || code.len() != 3
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(miette!("malformed protected HTTP response status line"));
+    }
+    let status = code
+        .parse::<http::StatusCode>()
+        .map_err(|_| miette!("invalid protected HTTP response status"))?;
+    Ok(format!(
+        "{version} {code} {}",
+        status.canonical_reason().unwrap_or("")
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1897,25 +2168,32 @@ where
         if line.is_empty() {
             return Ok(trailers);
         }
-        let line = std::str::from_utf8(&line)
-            .map_err(|_| miette!("HTTP response trailer contains invalid UTF-8"))?;
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| miette!("Malformed HTTP response trailer"))?;
-        validate_http_field_name(name)?;
-        validate_http_field_value(value.trim())?;
-        let name = name.to_ascii_lowercase();
-        if is_protected_response_field(&name) || connection_nominated_headers.contains(&name) {
-            return Err(miette!("HTTP response trailer uses a protected field name"));
-        }
-        trailers.push(HttpHeader {
-            name,
-            value: value.trim().to_string(),
-        });
+        trailers.push(parse_response_trailer(&line, connection_nominated_headers)?);
         if trailers.len() > openshell_supervisor_middleware::MAX_MIDDLEWARE_HEADERS {
             return Err(miette!("HTTP response trailer count exceeds limit"));
         }
     }
+}
+
+fn parse_response_trailer(
+    line: &[u8],
+    connection_nominated_headers: &[String],
+) -> Result<HttpHeader> {
+    let line = std::str::from_utf8(line)
+        .map_err(|_| miette!("HTTP response trailer contains invalid UTF-8"))?;
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| miette!("Malformed HTTP response trailer"))?;
+    validate_http_field_name(name)?;
+    validate_http_field_value(value.trim())?;
+    let name = name.to_ascii_lowercase();
+    if is_protected_response_field(&name) || connection_nominated_headers.contains(&name) {
+        return Err(miette!("HTTP response trailer uses a protected field name"));
+    }
+    Ok(HttpHeader {
+        name,
+        value: value.trim().to_string(),
+    })
 }
 
 async fn write_response_trailers<C: AsyncWrite + Unpin>(
