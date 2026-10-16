@@ -5373,6 +5373,22 @@ network_policies:
         }
     }
 
+    fn startup_gateway_snapshot(
+        policy: openshell_core::proto::SandboxPolicy,
+        version: u32,
+    ) -> openshell_core::grpc_client::SettingsPollResult {
+        let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+            .expect("valid startup gateway policy");
+        openshell_core::grpc_client::SettingsPollResult {
+            policy_hash: openshell_core::policy_identity::deterministic_policy_hash(&policy),
+            ..settings_poll_result(
+                Some(policy),
+                version,
+                openshell_core::proto::PolicySource::Sandbox,
+            )
+        }
+    }
+
     #[derive(Clone)]
     struct TestStartupGateway {
         desired: Arc<std::sync::Mutex<openshell_core::grpc_client::SettingsPollResult>>,
@@ -5482,11 +5498,7 @@ network_policies:
             enrich_proto_baseline_paths(&mut policy);
             let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
             let gateway = TestStartupGateway {
-                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
-                    Some(policy),
-                    1,
-                    openshell_core::proto::PolicySource::Sandbox,
-                ))),
+                desired: Arc::new(std::sync::Mutex::new(startup_gateway_snapshot(policy, 1))),
                 reports,
                 reject_next_accept: Arc::new(AtomicBool::new(false)),
                 snapshot_error: None,
@@ -5653,10 +5665,10 @@ network_policies:
 
     #[tokio::test]
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
-        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
+        use openshell_core::proto::ConfigurationAdmissionState;
         let mut policy = proto_policy_fixture();
         enrich_proto_baseline_paths(&mut policy);
-        let mut rejected = settings_poll_result(Some(policy), 1, PolicySource::Sandbox);
+        let mut rejected = startup_gateway_snapshot(policy, 1);
         rejected.configuration_admitted = false;
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
         let gateway = TestStartupGateway {
