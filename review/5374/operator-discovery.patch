@@ -1,0 +1,246 @@
+diff --git a/deploy/helm/openshell/README.md b/deploy/helm/openshell/README.md
+index bc6676b9f171450e7dcab2da07e112ea698bc983..25d77534280ba3c8246daf44bb7f3e7a87ae4c4a 100644
+--- a/deploy/helm/openshell/README.md
++++ b/deploy/helm/openshell/README.md
+@@ -257,8 +257,10 @@ Kubernetes cannot restrict `create` by `resourceNames`, and `resourceNames`
+ cannot express the digest-bearing name prefix needed for `get`. Enabling this
+ feature therefore gives the gateway/driver service account namespace-wide
+ ConfigMap `get` and `create` permissions in shared mode. In managed/operator
+-modes, the chart's ClusterRoleBinding makes those permissions cluster-wide for
+-the bound service account. The chart does not grant ConfigMap `list`, `watch`,
++modes, the standard ClusterRole grants these permissions cluster-wide. With
++`rbac.clusterScoped.operatorDiscoveryNamespace`, supply them separately with a
++Role and RoleBinding in the selected workspace namespace. The chart does not
++grant ConfigMap `list`, `watch`,
+ `patch`, `update`, or `delete`. Use a dedicated gateway service account and
+ namespace-scoped bindings when this boundary matters. If you render the TOML
+ setting outside this Helm value, grant `get` and `create` in every target
+@@ -630,6 +632,7 @@ discovery endpoint or its TLS CA.
+ | rbac.clusterScoped.clusterRoleBindingName | string | `""` | Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+ | rbac.clusterScoped.clusterRoleName | string | `""` | Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default. |
+ | rbac.clusterScoped.create | bool | `true` | Create the cluster-scoped ClusterRole and ClusterRoleBinding. Disable for a namespace-admin install where a cluster-admin applies them separately; the gateway ServiceAccount name and namespace are unchanged, so a pre-created ClusterRoleBinding still matches. |
++| rbac.clusterScoped.operatorDiscoveryNamespace | string | `nil` | Select cluster discovery for one file-backed operator workspace by naming its namespace. Requires a named default RuntimeClass. Null keeps the standard rules. |
+ | rbac.create | bool | `true` | Create the RBAC objects that grant the gateway ServiceAccount access. Disable to supply the namespaced sandbox and peer Role/RoleBinding and the cluster-scoped ClusterRole/ClusterRoleBinding out of band. The certgen hook and credential driver RBAC keep their own flags. |
+ | replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
+ | resources | object | `{}` | Gateway pod resource requests and limits. |
+diff --git a/deploy/helm/openshell/README.md.gotmpl b/deploy/helm/openshell/README.md.gotmpl
+index 5b3343aeac39eed8511a5201a80d1478f293b96d..299a182e78a5b0b3f9ef867fe7ae6c6edf42c191 100644
+--- a/deploy/helm/openshell/README.md.gotmpl
++++ b/deploy/helm/openshell/README.md.gotmpl
+@@ -258,8 +258,10 @@ Kubernetes cannot restrict `create` by `resourceNames`, and `resourceNames`
+ cannot express the digest-bearing name prefix needed for `get`. Enabling this
+ feature therefore gives the gateway/driver service account namespace-wide
+ ConfigMap `get` and `create` permissions in shared mode. In managed/operator
+-modes, the chart's ClusterRoleBinding makes those permissions cluster-wide for
+-the bound service account. The chart does not grant ConfigMap `list`, `watch`,
++modes, the standard ClusterRole grants these permissions cluster-wide. With
++`rbac.clusterScoped.operatorDiscoveryNamespace`, supply them separately with a
++Role and RoleBinding in the selected workspace namespace. The chart does not
++grant ConfigMap `list`, `watch`,
+ `patch`, `update`, or `delete`. Use a dedicated gateway service account and
+ namespace-scoped bindings when this boundary matters. If you render the TOML
+ setting outside this Helm value, grant `get` and `create` in every target
+diff --git a/deploy/helm/openshell/templates/clusterrole.yaml b/deploy/helm/openshell/templates/clusterrole.yaml
+index 8af91e1901c5c4d2af4abd60c1ef3ffa9af29a32..2817d5c9b314e33e3ba7598e02b5bbf9c4caaaf9 100644
+--- a/deploy/helm/openshell/templates/clusterrole.yaml
++++ b/deploy/helm/openshell/templates/clusterrole.yaml
+@@ -19,6 +19,34 @@ metadata:
+   labels:
+     {{- include "openshell.labels" . | nindent 4 }}
+ rules:
++  {{- $rbac := include "openshell.clusterScopedRbacValues" . | fromYaml }}
++  {{- $namespace := $rbac.operatorDiscoveryNamespace }}
++  {{- if ne $namespace nil }}
++  {{- if or (ne $workspaceMode "operator") (empty $kubernetesConfig.operator_namespace_file) $kubernetesConfig.operator_namespace_label }}
++  {{- fail "rbac.clusterScoped.operatorDiscoveryNamespace requires operator workspace mode with operator_namespace_file and no namespace label selector" }}
++  {{- end }}
++  {{- if not (and (kindIs "string" $namespace) (le (len $namespace) 63) (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $namespace)) }}
++  {{- fail "rbac.clusterScoped.operatorDiscoveryNamespace must be a Kubernetes namespace name" }}
++  {{- end }}
++  {{- $class := $kubernetesConfig.default_runtime_class_name }}
++  {{- if not (and (kindIs "string" $class) (le (len $class) 253) (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $class)) }}
++  {{- fail "operator discovery requires a named default_runtime_class_name" }}
++  {{- end }}
++  - apiGroups: [""]
++    resources: ["namespaces"]
++    resourceNames: {{ list .Release.Namespace $namespace | uniq | toJson }}
++    verbs: ["get"]
++  - apiGroups: ["node.k8s.io"]
++    resources: ["runtimeclasses"]
++    resourceNames: [{{ $class | quote }}]
++    verbs: ["get"]
++  - apiGroups: ["agents.x-k8s.io"]
++    resources: ["sandboxes"]
++    verbs: ["list", "watch"]
++  - apiGroups: ["authentication.k8s.io"]
++    resources: ["tokenreviews"]
++    verbs: ["create"]
++  {{- else }}
+   - apiGroups: ["node.k8s.io"]
+     resources: ["runtimeclasses"]
+     verbs: ["get"]
+@@ -152,3 +180,4 @@ rules:
+   {{- end }}
+   {{- end }}
+ {{- end }}
++{{- end }}
+diff --git a/deploy/helm/openshell/tests/clusterrole_test.yaml b/deploy/helm/openshell/tests/clusterrole_test.yaml
+index 309b10fc0e6b65b3425b4e248aafdd2817f6df74..9996062634227ba8c172b10747ea2d72b1805af4 100644
+--- a/deploy/helm/openshell/tests/clusterrole_test.yaml
++++ b/deploy/helm/openshell/tests/clusterrole_test.yaml
+@@ -221,3 +221,61 @@ tests:
+       - equal:
+           path: metadata.name
+           value: openshell-node-reader-my-namespace
++
++  - it: grants only discovery for a file-backed operator workspace
++    set: &operatorDiscovery
++      rbac.clusterScoped.operatorDiscoveryNamespace: team-a
++      server.drivers.kubernetes.workspaceMode: operator
++      server.drivers.kubernetes.operatorNamespaceFile: /config/workspaces.json
++      server.defaultRuntimeClassName: sandboxed
++    asserts:
++      - equal:
++          path: rules
++          value:
++            - apiGroups: [""]
++              resources: ["namespaces"]
++              resourceNames: ["my-namespace", "team-a"]
++              verbs: ["get"]
++            - apiGroups: ["node.k8s.io"]
++              resources: ["runtimeclasses"]
++              resourceNames: ["sandboxed"]
++              verbs: ["get"]
++            - apiGroups: ["agents.x-k8s.io"]
++              resources: ["sandboxes"]
++              verbs: ["list", "watch"]
++            - apiGroups: ["authentication.k8s.io"]
++              resources: ["tokenreviews"]
++              verbs: ["create"]
++
++  - it: refuses discovery for a managed workspace
++    set:
++      <<: *operatorDiscovery
++      server.drivers.kubernetes.workspaceMode: managed
++    asserts:
++      - failedTemplate:
++          errorMessage: rbac.clusterScoped.operatorDiscoveryNamespace requires operator workspace mode with operator_namespace_file and no namespace label selector
++
++  - it: refuses namespace discovery by label
++    set:
++      <<: *operatorDiscovery
++      server.drivers.kubernetes.operatorNamespaceFile: ""
++      server.drivers.kubernetes.operatorNamespaceLabel: openshell.ai/workspace=true
++    asserts:
++      - failedTemplate:
++          errorMessage: rbac.clusterScoped.operatorDiscoveryNamespace requires operator workspace mode with operator_namespace_file and no namespace label selector
++
++  - it: refuses a wildcard workspace namespace
++    set:
++      <<: *operatorDiscovery
++      rbac.clusterScoped.operatorDiscoveryNamespace: "*"
++    asserts:
++      - failedTemplate:
++          errorMessage: rbac.clusterScoped.operatorDiscoveryNamespace must be a Kubernetes namespace name
++
++  - it: requires a named runtime class for discovery
++    set:
++      <<: *operatorDiscovery
++      server.defaultRuntimeClassName: ""
++    asserts:
++      - failedTemplate:
++          errorMessage: operator discovery requires a named default_runtime_class_name
+diff --git a/deploy/helm/openshell/values.yaml b/deploy/helm/openshell/values.yaml
+index 987744afbb8470f4872158f7c740dc58ea57d0b6..3115d14b25af8fe483c8ddf2003975655d9e6ac8 100644
+--- a/deploy/helm/openshell/values.yaml
++++ b/deploy/helm/openshell/values.yaml
+@@ -224,6 +224,9 @@ rbac:
+     # separately; the gateway ServiceAccount name and namespace are unchanged,
+     # so a pre-created ClusterRoleBinding still matches.
+     create: true
++    # -- Select cluster discovery for one file-backed operator workspace by naming
++    # its namespace. Requires a named default RuntimeClass. Null keeps the standard rules.
++    operatorDiscoveryNamespace: null
+     # -- Name for the ClusterRole. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+     clusterRoleName: ""
+     # -- Name for the ClusterRoleBinding. Empty uses the `<fullname>-node-reader-<release namespace>` default.
+diff --git a/docs/how-it-works/gateways/configuration.mdx b/docs/how-it-works/gateways/configuration.mdx
+index 8d39d6bbafd3a8e754d4b7d824f9048e28bd0a19..99b34fdf6a3ea44af0dd5d7c7e7ec74afd40ff13 100644
+--- a/docs/how-it-works/gateways/configuration.mdx
++++ b/docs/how-it-works/gateways/configuration.mdx
+@@ -183,10 +183,11 @@ Use this sequence for a non-disruptive private-CA rollover:
+ For Helm, create an operator-owned ConfigMap with a `ca.crt` key and set
+ `supervisor.network.additionalCaConfigMapName`. The chart mounts the source at
+ `/etc/openshell-tls/additional-ca-source/ca.crt`, renders that path in
+-the global table, and grants the Kubernetes driver ConfigMap `get` and `create`
+-permissions for the selected workspace mode. These permissions cover the shared
+-sandbox namespace in shared mode and are cluster-wide through the existing
+-ClusterRoleBinding in managed and operator modes. Kubernetes RBAC cannot limit
++the global table, and configures the Kubernetes driver to use the bundle.
++The chart's standard RBAC grants ConfigMap `get` and `create` in the shared
++sandbox namespace in shared mode and cluster-wide in managed and operator modes.
++With `rbac.clusterScoped.operatorDiscoveryNamespace`, supply these permissions
++in the selected workspace namespace. Kubernetes RBAC cannot limit
+ `create` by resource name or limit `get` to the digest-bearing name prefix. The
+ chart does not grant ConfigMap `list`, `watch`, `patch`, `update`, or `delete`
+ for this feature. Use a dedicated gateway service account and namespace-scoped
+diff --git a/docs/kubernetes/setup.mdx b/docs/kubernetes/setup.mdx
+index a053a8f70957a5583136ce938a6ec678f92495c8..89e30e22a5d784d59c00379d2f724adfa4690908 100644
+--- a/docs/kubernetes/setup.mdx
++++ b/docs/kubernetes/setup.mdx
+@@ -445,6 +445,26 @@ helm upgrade --install openshell \
+ 
+ The ServiceAccount must already have the Role and ClusterRole bindings described above.
+ 
++### Limit cluster discovery to a file-backed operator workspace
++
++With chart-managed cluster RBAC and a separate workspace release, set
++`rbac.clusterScoped.operatorDiscoveryNamespace` to that workspace namespace.
++Use operator mode with `operator_namespace_file` and a named
++`default_runtime_class_name`. Keep the workspace name in the file and the Helm
++value in sync.
++
++The gateway can get its release namespace, the selected workspace namespace,
++and the named RuntimeClass. It can list and watch sandboxes across the cluster
++and create TokenReviews. The existing ClusterRoleBinding selects the gateway
++ServiceAccount. Leave the value unset to use the standard role, for example
++when GPU capacity checks need to list nodes.
++
++If you set `supervisor.network.additionalCaConfigMapName`, first bind a Role in
++the selected workspace namespace to the gateway ServiceAccount. Grant `get` and
++`create` on core `configmaps` so the driver can validate or create the sandbox
++destination CA ConfigMap. The stock workspace Role omits these permissions.
++Leave the CA setting empty if you cannot grant these permissions.
++
+ ### Installing without cluster-admin
+ 
+ By default the release creates the `ClusterRole` and `ClusterRoleBinding`, so
+diff --git a/skills/debug-openshell-cluster/SKILL.md b/skills/debug-openshell-cluster/SKILL.md
+index 23d58efa25a7bad70d0752a818ee6ca1938d66b2..500650d61815d73e44c5ef444d3e42b147877df5 100644
+--- a/skills/debug-openshell-cluster/SKILL.md
++++ b/skills/debug-openshell-cluster/SKILL.md
+@@ -588,8 +588,10 @@ after the API check.
+ Kubernetes RBAC cannot restrict `create` by `resourceNames` or restrict `get`
+ by a name prefix. When this feature is enabled, the chart grants the gateway
+ service account ConfigMap `get`/`create` in the shared sandbox namespace. In
+-managed/operator modes, the existing ClusterRoleBinding makes those permissions
+-cluster-wide. It does not grant ConfigMap `list`, `watch`, `patch`, `update`, or
++managed/operator modes, the standard ClusterRole grants those permissions
++cluster-wide. With `rbac.clusterScoped.operatorDiscoveryNamespace`, check the
++gateway ServiceAccount's separate RoleBinding in the workspace namespace.
++The chart does not grant ConfigMap `list`, `watch`, `patch`, `update`, or
+ `delete`. Prefer a dedicated gateway service account and namespace-scoped
+ bindings when the read boundary matters. Check the objects and authorization:
+ 
+@@ -1120,6 +1122,11 @@ kubectl auth can-i create sandboxes.agents.x-k8s.io \
+   --as system:serviceaccount:openshell:openshell
+ ```
+ 
++For file-backed operator discovery, compare
++`rbac.clusterScoped.operatorDiscoveryNamespace` with the workspace in the
++namespace file. Check the cluster role for the namespace and RuntimeClass reads,
++and the workspace RoleBinding for sandbox mutations.
++
+ If the gateway cannot create or watch sandboxes, verify the workspace
+ RoleBinding subject matches the gateway ServiceAccount name and namespace.
+ If SSH relay connections fail, verify the workspace NetworkPolicy selects the
