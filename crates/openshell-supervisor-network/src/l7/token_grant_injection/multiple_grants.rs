@@ -69,6 +69,23 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
 }
 
 #[tokio::test]
+async fn basic_grant_refuses_selector_only_forwarding_before_acquisition() {
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
+    fixture
+        .dynamic_credentials()
+        .write()
+        .unwrap()
+        .get_mut(SERVICE)
+        .unwrap()
+        .auth_style = "basic".into();
+    ctx.provider_credentials = Some(fixture.provider_credentials());
+    ctx.request_default_port = Some(443);
+
+    assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
+    fixture.assert_no_requests();
+}
+
+#[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
@@ -310,6 +327,8 @@ async fn admitted_owners_select_grants_independently_per_header() {
         (&["identity-owner"], false, true),
         (&["test-owner", "identity-owner"], true, true),
     ];
+    let endpoint = regorus::Value::from_json_str(r#"{"protocol":"rest"}"#).unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
     for (admitted, service, identity) in cases {
         let (fixture, mut ctx) = fixture(Ok("identity-token"));
         fixture
@@ -331,6 +350,7 @@ async fn admitted_owners_select_grants_independently_per_header() {
             &ctx,
             &state.snapshot(),
             &owners,
+            &config,
             REQUEST_ID,
             None,
         )
