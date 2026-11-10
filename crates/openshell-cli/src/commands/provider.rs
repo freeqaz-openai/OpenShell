@@ -822,6 +822,9 @@ pub async fn fetch_provider_profile_catalog(
             .await
             .into_diagnostic()?
             .into_inner();
+        for profile in &response.profiles {
+            validate_profile_grant_types(profile).into_diagnostic()?;
+        }
         profiles.extend(response.profiles);
         if response.next_page_token.is_empty() {
             break;
@@ -869,11 +872,23 @@ async fn fetch_provider_profile_exact(
         }))
         .await
         .and_then(|response| {
-            response
-                .into_inner()
-                .profile
-                .ok_or_else(|| Status::internal("provider profile missing from response"))
+            let profile = response.into_inner().profile.ok_or_else(|| {
+                Status::internal(format!(
+                    "provider profile '{provider_type}' missing from response"
+                ))
+            })?;
+            validate_profile_grant_types(&profile)?;
+            Ok(profile)
         })
+}
+
+fn validate_profile_grant_types(profile: &ProviderProfile) -> std::result::Result<(), Status> {
+    if let Some(diagnostic) =
+        openshell_providers::unknown_token_grant_type_diagnostic("gateway", profile)
+    {
+        return Err(Status::failed_precondition(diagnostic.message));
+    }
+    Ok(())
 }
 
 async fn discover_existing_provider_data(
@@ -1679,17 +1694,9 @@ pub async fn provider_profile_describe_text(
     tls: &TlsOptions,
 ) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_profile(assertion_profile_request(GetProviderProfileRequest {
-            id: id.to_string(),
-            workspace_scope: provider_profile_workspace_scope(workspace),
-        }))
+    let profile = fetch_provider_profile_exact(&mut client, id, workspace)
         .await
         .into_diagnostic()?;
-    let profile = response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
 
     format_provider_profile_description(&profile, output)
 }
@@ -1718,17 +1725,9 @@ pub async fn provider_profile_export_text(
     tls: &TlsOptions,
 ) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_profile(assertion_profile_request(GetProviderProfileRequest {
-            id: id.to_string(),
-            workspace_scope: provider_profile_workspace_scope(workspace),
-        }))
+    let profile = fetch_provider_profile_exact(&mut client, id, workspace)
         .await
         .into_diagnostic()?;
-    let profile = response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
     match output {

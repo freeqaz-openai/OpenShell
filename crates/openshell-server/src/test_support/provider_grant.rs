@@ -24,7 +24,7 @@ use crate::{MultiplexService, OpenShellService, Store, TlsAcceptor};
 
 pub const SANDBOX: &str = "wire-sandbox";
 pub const PROVIDER_ID: &str = "wire-provider-id";
-const SIBLING: &str = "wire-sibling";
+pub const SIBLING: &str = "wire-sibling";
 const PROVIDER: &str = "wire-provider";
 const GATEWAY: &str = "wire-gateway";
 
