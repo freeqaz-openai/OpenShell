@@ -997,7 +997,7 @@ gateway before retrying the scrape.
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.
-For `openshell_client_credentials` grants, check the gateway signing configuration,
+For `client_credentials` grants with `assertion_source: openshell_gateway`, check the gateway signing configuration,
 supervisor-to-gateway TLS, and the provider ID, credential key and token endpoint in
 the operator registration. SPIRE is used by both the gateway and sandbox supervisors
 for `token_exchange` grants. The gateway pod must mount the `spiffe-workload-api` CSI volume

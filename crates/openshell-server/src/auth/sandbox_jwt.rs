@@ -55,6 +55,20 @@ pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSan
 /// checks.
 const SPIFFE_SUBJECT_PREFIX: &str = "spiffe://openshell/sandbox/";
 
+#[derive(Serialize)]
+struct ProviderClientAssertionClaims<'a> {
+    iss: &'a str,
+    sub: String,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+    jti: String,
+    caller_kind: ExtensionCallerKind,
+    sandbox_id: &'a str,
+    provider_id: &'a str,
+    credential_key: &'a str,
+}
+
 /// Public JSON Web Key Set served by the gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GatewayJwks {
@@ -538,18 +552,18 @@ impl ExtensionJwtIssuer {
             ));
         }
         let issued_at = now_secs();
-        let claims = serde_json::json!({
-            "iss": self.issuer,
-            "sub": format!("openshell-sandbox:{sandbox_id}"),
-            "aud": endpoint,
-            "iat": issued_at,
-            "exp": issued_at + 60,
-            "jti": uuid::Uuid::new_v4().to_string(),
-            "caller_kind": "supervisor",
-            "sandbox_id": sandbox_id,
-            "provider_id": provider_id,
-            "credential_key": credential_key,
-        });
+        let claims = ProviderClientAssertionClaims {
+            iss: &self.issuer,
+            sub: format!("openshell-sandbox:{sandbox_id}"),
+            aud: endpoint,
+            iat: issued_at,
+            exp: issued_at.saturating_add(60),
+            jti: uuid::Uuid::new_v4().to_string(),
+            caller_kind: ExtensionCallerKind::Supervisor,
+            sandbox_id,
+            provider_id,
+            credential_key,
+        };
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.kid.clone());
         header.typ = Some("openshell-provider-assertion+jwt".into());

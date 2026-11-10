@@ -4,7 +4,7 @@
 //! `OAuth2` token acquisition for endpoint-bound provider credentials.
 //!
 //! The supervisor normally authenticates using the sandbox's SPIFFE JWT-SVID.
-//! An `openshell_client_credentials` profile uses a dedicated, gateway-signed
+//! A `client_credentials` profile with `assertion_source: openshell_gateway` uses a dedicated, gateway-signed
 //! assertion for its registered token endpoint. Each grant returns an access
 //! token for injection at the matching provider endpoint.
 //!
@@ -146,8 +146,10 @@ impl SandboxInstanceTokenGrants {
         let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
             .map_err(|_| configuration_failure())?;
         if grant_type == ProviderCredentialTokenGrantType::OpenshellClientCredentials
-            && (!request.jwt_svid_audience.is_empty()
+            && (request.provider_id.is_empty()
+                || !request.jwt_svid_audience.is_empty()
                 || !request.client_assertion_type.is_empty()
+                || !request.requested_token_type.is_empty()
                 || !openshell_core::provider_credentials::provider_assertion_endpoint(
                     request.token_endpoint,
                 ))
@@ -187,6 +189,7 @@ impl SandboxInstanceTokenGrants {
                                     provider: provider.into(),
                                     credential_key: credential_key.into(),
                                     token_endpoint: request.token_endpoint.into(),
+                                    expected_provider_id: request.provider_id.into(),
                                 },
                                 request.request_id,
                             )
@@ -277,6 +280,8 @@ impl SandboxInstanceTokenGrants {
 /// One provider token request; see [`SandboxInstanceTokenGrants::obtain_provider_token`].
 pub struct ObtainProviderTokenRequest<'a> {
     pub provider_name: &'a str,
+    /// Immutable identity from gateway-delivered installed credential metadata.
+    pub provider_id: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
     pub client_assertion_type: &'a str,
@@ -703,6 +708,7 @@ mod tests {
             SandboxInstanceTokenGrants::new(Some(gateway), Some("sandbox-id".into()), None);
         let request = |grant_type: ProviderCredentialTokenGrantType| ObtainProviderTokenRequest {
             provider_name: "attached:access",
+            provider_id: "provider-id",
             token_endpoint: "https://issuer.example/token",
             jwt_svid_audience: "",
             client_assertion_type: "",

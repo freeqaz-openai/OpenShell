@@ -405,6 +405,8 @@ pub struct ServerState {
 
     /// Operator registrations for outbound provider client assertions.
     pub provider_assertions: Vec<config_file::ProviderAssertionRegistration>,
+    /// Separate per-sandbox budget for provider assertions before catalog lookup.
+    pub(crate) provider_assertion_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter,
     /// Signing authority and public verification metadata for outbound JWTs.
     pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
@@ -676,6 +678,10 @@ impl ServerState {
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             provider_assertions: Vec::new(),
+            provider_assertion_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::new(
+                Duration::from_mins(1),
+                60,
+            ),
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
