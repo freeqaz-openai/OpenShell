@@ -3,6 +3,7 @@
 
 //! In-memory gateway with real launch credentials for the supervisor wire test.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,9 +29,32 @@ pub const SIBLING: &str = "wire-sibling";
 const PROVIDER: &str = "wire-provider";
 const GATEWAY: &str = "wire-gateway";
 
+/// Exact synthetic identities used when a second local fixture verifies the assertion.
+pub struct ProviderGrantIdentity<'a> {
+    pub sandbox_id: &'a str,
+    pub provider_id: &'a str,
+    pub gateway_name: &'a str,
+    pub key_id: &'a str,
+    pub signing_pem: &'a [u8],
+    pub public_pem: &'a [u8],
+}
+
+pub fn middleware_credential(
+    name: String,
+    bearer: &str,
+) -> HashMap<String, openshell_extension_core::BearerTokenSlot> {
+    let token = bearer.strip_prefix("Bearer ").unwrap_or(bearer);
+    HashMap::from([(
+        name,
+        openshell_extension_core::BearerTokenSlot::new(token, i64::MAX)
+            .expect("synthetic middleware credential"),
+    )])
+}
+
 pub struct ProviderGrantGateway {
     pub sandbox: GatewayEndpoint,
     pub sibling: GatewayEndpoint,
+    sandbox_id: String,
     service: OpenShellService,
     accept_loop: JoinHandle<()>,
     _shutdown: watch::Sender<bool>,
@@ -50,30 +74,57 @@ impl ProviderGrantGateway {
         endpoint: &str,
         environment: &[(&str, &str)],
     ) -> Self {
-        let mut state = super::gateway_state_with_driver("test").await;
         let key = openshell_bootstrap::jwt::generate_jwt_key().expect("test signing key");
+        let identity = ProviderGrantIdentity {
+            sandbox_id: SANDBOX,
+            provider_id: PROVIDER_ID,
+            gateway_name: GATEWAY,
+            key_id: &key.kid,
+            signing_pem: key.signing_key_pem.as_bytes(),
+            public_pem: key.public_key_pem.as_bytes(),
+        };
+        Self::start_with_identity(
+            tls,
+            profile,
+            credential_key,
+            endpoint,
+            environment,
+            identity,
+        )
+        .await
+    }
+
+    pub async fn start_with_identity(
+        tls: TlsAcceptor,
+        profile: ProviderProfile,
+        credential_key: &str,
+        endpoint: &str,
+        environment: &[(&str, &str)],
+        identity: ProviderGrantIdentity<'_>,
+    ) -> Self {
+        let mut state = super::gateway_state_with_driver("test").await;
         let authority = Arc::new(
             SandboxSessionJwtAuthority::from_pem(
-                key.signing_key_pem.as_bytes(),
-                key.public_key_pem.as_bytes(),
-                key.kid.clone(),
-                GATEWAY,
+                identity.signing_pem,
+                identity.public_pem,
+                identity.key_id.to_string(),
+                identity.gateway_name,
                 Some(Duration::from_secs(900)),
             )
             .expect("session authority"),
         );
         let assertion_issuer = ExtensionJwtIssuer::from_pem(
-            key.signing_key_pem.as_bytes(),
-            key.public_key_pem.as_bytes(),
-            key.kid.clone(),
-            GATEWAY,
+            identity.signing_pem,
+            identity.public_pem,
+            identity.key_id.to_string(),
+            identity.gateway_name,
             Duration::from_secs(300),
         )
         .expect("assertion issuer");
         state.sandbox_session_jwt_authority = Some(authority.clone());
         state.extension_jwt_issuer = Some(Arc::new(assertion_issuer));
         state.provider_assertions = vec![ProviderAssertionRegistration {
-            provider_id: PROVIDER_ID.into(),
+            provider_id: identity.provider_id.into(),
             credential_key: credential_key.into(),
             token_endpoint: endpoint.into(),
         }];
@@ -108,9 +159,9 @@ impl ProviderGrantGateway {
         persist(
             &state.store,
             PROVIDER,
-            PROVIDER_ID,
+            identity.provider_id,
             Provider {
-                metadata: Some(metadata(PROVIDER, PROVIDER_ID)),
+                metadata: Some(metadata(PROVIDER, identity.provider_id)),
                 r#type: profile_id,
                 profile_workspace: "default".into(),
                 credentials: environment
@@ -122,7 +173,7 @@ impl ProviderGrantGateway {
         )
         .await;
         let sandbox_credentials =
-            persist_sandbox(&state.store, &authority, SANDBOX, PROVIDER).await;
+            persist_sandbox(&state.store, &authority, identity.sandbox_id, PROVIDER).await;
         let sibling_credentials =
             persist_sandbox(&state.store, &authority, SIBLING, PROVIDER).await;
         let listener = crate::bind_gateway_listener(([127, 0, 0, 1], 0).into())
@@ -141,6 +192,7 @@ impl ProviderGrantGateway {
         Self {
             sandbox: GatewayEndpoint::new(url.clone(), sandbox_credentials),
             sibling: GatewayEndpoint::new(url, sibling_credentials),
+            sandbox_id: identity.sandbox_id.into(),
             service: OpenShellService::new(state),
             accept_loop,
             _shutdown: shutdown,
@@ -151,7 +203,7 @@ impl ProviderGrantGateway {
         let request = super::authenticate_as_dev_user(tonic::Request::new(()))
             .expect("fixture user")
             .map(|()| DetachSandboxProviderRequest {
-                sandbox: SANDBOX.into(),
+                sandbox: self.sandbox_id.clone(),
                 provider: PROVIDER.into(),
                 workspace_scope: Some(workspace_selector("default")),
                 ..Default::default()

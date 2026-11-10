@@ -67,7 +67,7 @@ const RESOURCE_AUDIENCE: &str = "api://wire-origin";
 #[test]
 fn provider_client_assertion_wire() {
     let name = concat!(module_path!(), "::provider_client_assertion_wire");
-    with_tls_fixture(name, |cert_dir| run_bounded(run(cert_dir), WAIT * 4));
+    with_tls_fixture(name, None, |cert_dir| run_bounded(run(cert_dir), WAIT * 4));
 }
 
 fn run_bounded(exercise: impl Future<Output = ()>, timeout: Duration) {
@@ -82,7 +82,7 @@ fn run_bounded(exercise: impl Future<Output = ()>, timeout: Duration) {
         });
 }
 
-fn with_tls_fixture(full_name: &str, exercise: impl FnOnce(&Path)) {
+fn with_tls_fixture(full_name: &str, token_ca: Option<&Path>, exercise: impl FnOnce(&Path)) {
     if let Some(cert_dir) = std::env::var_os(CHILD_CERT_DIR) {
         exercise(Path::new(&cert_dir));
         return;
@@ -91,7 +91,12 @@ fn with_tls_fixture(full_name: &str, exercise: impl FnOnce(&Path)) {
     // TLS trust is process configuration for both real clients. Give this case
     // an isolated process so other tests never observe its ephemeral CA.
     let cert_dir = tempfile::tempdir().unwrap();
-    let pki = openshell_otel_test_support::TestPki::generate();
+    let mut pki = openshell_otel_test_support::TestPki::generate();
+    if let Some(token_ca) = token_ca {
+        pki.ca_pem.push('\n');
+        pki.ca_pem
+            .push_str(&std::fs::read_to_string(token_ca).expect("read local token service CA"));
+    }
     for (name, pem) in [
         ("ca.pem", pki.ca_pem),
         ("server-cert.pem", pki.server.cert_pem),
@@ -101,7 +106,11 @@ fn with_tls_fixture(full_name: &str, exercise: impl FnOnce(&Path)) {
     }
     let ca = cert_dir.path().join("ca.pem");
     let (_, test_name) = full_name.split_once("::").expect("crate prefix");
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    if token_ca.is_some() {
+        child.arg("--ignored");
+    }
+    let output = child
         .args(["--exact", test_name, "--nocapture"])
         .env(CHILD_CERT_DIR, cert_dir.path())
         .env("SSL_CERT_FILE", &ca)

@@ -4,7 +4,7 @@
 use super::*;
 
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::atomic::AtomicU32;
 
 use axum::body::{Body, to_bytes};
@@ -16,6 +16,8 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config};
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
+
+mod joined;
 
 const ORIGIN_HOST: &str = "host.openshell.internal";
 const REPOSITORY: &str = "/team/repo.git";
@@ -45,7 +47,7 @@ fn provider_client_assertion_raw_placeholder_wire() {
 }
 
 fn run_placeholder_test(name: &str, raw: bool) {
-    with_tls_fixture(name, |cert_dir| {
+    with_tls_fixture(name, None, |cert_dir| {
         run_bounded(exercise(cert_dir, raw), WAIT * 4);
     });
 }
@@ -330,7 +332,11 @@ enum ExpectedFetch {
     Withdrawn,
 }
 
-async fn fetch_fresh(mut command: AsyncCommand, oid: &str, expected: ExpectedFetch) {
+async fn fetch_fresh(
+    mut command: AsyncCommand,
+    oid: &str,
+    expected: ExpectedFetch,
+) -> (Output, bool) {
     assert!(oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let client = tempfile::tempdir().unwrap();
     git_ok(client.path(), &["init"]).await;
@@ -351,6 +357,7 @@ async fn fetch_fresh(mut command: AsyncCommand, oid: &str, expected: ExpectedFet
             oid
         );
     }
+    (output, present)
 }
 
 struct Origin {
