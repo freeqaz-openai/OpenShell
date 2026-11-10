@@ -41,6 +41,7 @@ use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
 use spiffe::{WorkloadApiClient, WorkloadApiError};
+use tokio::time::Instant;
 
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
@@ -50,7 +51,22 @@ const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 #[derive(Clone)]
 struct CachedToken {
     access_token: String,
-    expires_at_ms: i64,
+    expiry: CacheExpiry,
+}
+
+#[derive(Clone, Copy)]
+struct CacheExpiry {
+    wall_ms: i64,
+    elapsed_deadline: Option<Instant>,
+}
+
+impl CacheExpiry {
+    fn is_fresh(self) -> bool {
+        self.wall_ms > current_time_ms()
+            && self
+                .elapsed_deadline
+                .is_none_or(|deadline| deadline > Instant::now())
+    }
 }
 
 /// Thread-safe token cache keyed by provider name.
@@ -67,24 +83,23 @@ impl TokenCache {
 
     /// Get a cached token if it exists and is not expired.
     fn get(&self, provider_name: &str) -> Option<String> {
-        let now_ms = current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(provider_name)?;
-        if cached.expires_at_ms > now_ms {
+        if cached.expiry.is_fresh() {
             Some(cached.access_token.clone())
         } else {
             None
         }
     }
 
-    /// Store a token with expiration time.
-    fn set(&self, provider_name: String, access_token: String, expires_at_ms: i64) {
+    /// Store a token with its reuse deadline.
+    fn set(&self, provider_name: String, access_token: String, expiry: CacheExpiry) {
         if let Ok(mut tokens) = self.tokens.write() {
             tokens.insert(
                 provider_name,
                 CachedToken {
                     access_token,
-                    expires_at_ms,
+                    expiry,
                 },
             );
         }
@@ -341,18 +356,36 @@ where
     {
         return Err(configuration_failure());
     }
+    let grant_started_at = Instant::now();
+    let grant_started_wall_ms = current_time_ms();
     let token_response = grant(jwt_audience).await?;
     validate_access_token(&token_response.access_token)?;
 
     let cache_ttl = token_cache_ttl(input.cache_ttl_override, token_response.expires_in);
     if !cache_ttl.is_zero() {
         let ttl_ms = i64::try_from(cache_ttl.as_millis()).unwrap_or(i64::MAX);
-        let expires_at_ms = current_time_ms().saturating_add(ttl_ms);
-        input.cache.set(
-            cache_key,
-            token_response.access_token.clone(),
-            expires_at_ms,
-        );
+        let expiry = if input.cache_ttl_override.is_none() && token_response.expires_in > 0 {
+            // A delayed grant response must not add to the broker's lifetime. Use both
+            // clocks so a wall-clock rollback cannot extend the elapsed reuse window.
+            grant_started_at
+                .checked_add(cache_ttl)
+                .map(|deadline| CacheExpiry {
+                    wall_ms: grant_started_wall_ms.saturating_add(ttl_ms),
+                    elapsed_deadline: Some(deadline),
+                })
+        } else {
+            // Explicit overrides and the missing-expiry fallback are measured from
+            // completion, as before.
+            Some(CacheExpiry {
+                wall_ms: current_time_ms().saturating_add(ttl_ms),
+                elapsed_deadline: None,
+            })
+        };
+        if let Some(expiry) = expiry.filter(|expiry| expiry.is_fresh()) {
+            input
+                .cache
+                .set(cache_key, token_response.access_token.clone(), expiry);
+        }
     }
 
     Ok(token_response.access_token)
@@ -457,7 +490,7 @@ fn token_cache_ttl(cache_ttl_override: Option<Duration>, expires_in: i64) -> Dur
     };
 
     Duration::from_secs(
-        u64::try_from(ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1))
+        u64::try_from(ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(0))
             .unwrap_or(u64::MAX),
     )
 }
@@ -612,7 +645,7 @@ pub mod test_support {
             let mut expired = 0;
             for key in keys {
                 if let Some(token) = cached.get_mut(key) {
-                    token.expires_at_ms = 0;
+                    token.expiry.wall_ms = 0;
                     expired += 1;
                 }
             }
@@ -1210,7 +1243,9 @@ mod tests {
             )
         );
         assert_eq!(token_cache_ttl(None, 60), Duration::from_secs(30));
-        assert_eq!(token_cache_ttl(None, 10), Duration::from_secs(1));
+        assert_eq!(token_cache_ttl(None, 10), Duration::ZERO);
+        assert_eq!(token_cache_ttl(None, 30), Duration::ZERO);
+        assert_eq!(token_cache_ttl(None, 31), Duration::from_secs(1));
     }
 
     #[test]
@@ -1257,7 +1292,14 @@ mod tests {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
             requested_token_type: ACCESS_TOKEN_TYPE,
         });
-        cache.set(identity_cache_key, "expired".into(), current_time_ms() - 1);
+        cache.set(
+            identity_cache_key,
+            "expired".into(),
+            CacheExpiry {
+                wall_ms: current_time_ms() - 1,
+                elapsed_deadline: None,
+            },
+        );
         let service_token = obtain_token_without_grant_call(
             &cache,
             service,
@@ -1399,7 +1441,10 @@ mod tests {
         cache.set(
             cache_key,
             "expired-token".to_string(),
-            current_time_ms() - 1,
+            CacheExpiry {
+                wall_ms: current_time_ms() - 1,
+                elapsed_deadline: None,
+            },
         );
 
         let token = obtain_counted_test_token(CountedTokenGrantInput {
@@ -1418,6 +1463,63 @@ mod tests {
 
         assert_eq!(token, "token-1");
         assert_eq!(grant_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_reported_cache_lifetime_includes_grant_latency() {
+        let cache = TokenCache::new();
+        let provider_name = "api.example.test\t443\t/v1/**\tprovider:access_token";
+        let token_endpoint = "https://auth.example.com/token";
+        let jwt_svid_audience = "https://auth.example.com";
+        let audience = "api://resource";
+        let scopes = ["read".to_string()];
+        let input = || ObtainProviderTokenInput {
+            cache: &cache,
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: "",
+            audience,
+            scopes: &scopes,
+            cache_ttl_override: None,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: ACCESS_TOKEN_TYPE,
+        };
+        let token = obtain_provider_token_with_grant(input(), |_| async {
+            tokio::time::advance(Duration::from_secs(14)).await;
+            Ok(OAuthTokenResponse {
+                access_token: "first-token".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 45,
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(token, "first-token");
+        let cached = obtain_provider_token_with_grant(input(), |_| async {
+            panic!("the unexpired grant should be reused");
+        })
+        .await
+        .unwrap();
+        assert_eq!(cached, "first-token");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let next = obtain_provider_token_with_grant(input(), |_| async {
+            // No time remains for reuse by the time the second response completes.
+            tokio::time::advance(Duration::from_secs(46)).await;
+            Ok(OAuthTokenResponse {
+                access_token: "next-token".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 45,
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(next, "next-token");
+        let stored = cache.tokens.read().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored.values().next().unwrap().access_token, "first-token");
+        assert!(!stored.values().next().unwrap().expiry.is_fresh());
     }
 
     #[tokio::test]
