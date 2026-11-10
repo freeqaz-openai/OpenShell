@@ -1665,12 +1665,8 @@ pub async fn mint_provider_client_assertion(
         .await
         .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
     let expected_provider_id = body.expected_provider_id.clone();
-    let mut request = tonic::Request::new(body);
-    if let Ok(id) = request_id.parse() {
-        request.metadata_mut().insert("x-request-id", id);
-    }
     let response = client
-        .mint_provider_client_assertion(request)
+        .mint_provider_client_assertion(token_grant_gateway_request(body, Some(request_id)))
         .await
         .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
         .into_inner();
@@ -1743,7 +1739,7 @@ pub async fn exchange_provider_subject_token(
     let mut client = connect(&gateway.with_url(endpoint.as_str()))
         .await
         .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
-    let request = provider_subject_token_exchange_request(
+    let request = token_grant_gateway_request(
         ExchangeProviderSubjectTokenRequest {
             sandbox_id: sandbox_id.to_string(),
             provider: provider.to_string(),
@@ -1761,13 +1757,10 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
-/// Attach the exchange's request ID as `x-request-id` gRPC metadata.
+/// Attach the grant's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.
-fn provider_subject_token_exchange_request(
-    body: ExchangeProviderSubjectTokenRequest,
-    request_id: Option<&str>,
-) -> tonic::Request<ExchangeProviderSubjectTokenRequest> {
+fn token_grant_gateway_request<T>(body: T, request_id: Option<&str>) -> tonic::Request<T> {
     let mut request = tonic::Request::new(body);
     if let Some(request_id) = request_id.and_then(|value| value.parse().ok()) {
         request.metadata_mut().insert("x-request-id", request_id);
@@ -1864,7 +1857,7 @@ mod token_grant_exchange_tests {
             (Some("line\nbreak"), None),
             (None, None),
         ] {
-            let request = provider_subject_token_exchange_request(
+            let request = token_grant_gateway_request(
                 ExchangeProviderSubjectTokenRequest::default(),
                 value,
             );
