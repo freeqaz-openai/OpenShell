@@ -520,6 +520,43 @@ impl ExtensionJwtIssuer {
         })
     }
 
+    /// Sign a provider-specific client assertion after attachment and recipient authorization.
+    pub(crate) fn mint_provider_client_assertion(
+        &self,
+        sandbox_id: &str,
+        provider_id: &str,
+        credential_key: &str,
+        endpoint: &str,
+    ) -> Result<String, Status> {
+        if sandbox_id.is_empty()
+            || provider_id.is_empty()
+            || credential_key.is_empty()
+            || !openshell_core::provider_credentials::provider_assertion_endpoint(endpoint)
+        {
+            return Err(Status::invalid_argument(
+                "invalid provider assertion binding",
+            ));
+        }
+        let issued_at = now_secs();
+        let claims = serde_json::json!({
+            "iss": self.issuer,
+            "sub": format!("openshell-sandbox:{sandbox_id}"),
+            "aud": endpoint,
+            "iat": issued_at,
+            "exp": issued_at + 60,
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "caller_kind": "supervisor",
+            "sandbox_id": sandbox_id,
+            "provider_id": provider_id,
+            "credential_key": credential_key,
+        });
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.kid.clone());
+        header.typ = Some("openshell-provider-assertion+jwt".into());
+        encode(&header, &claims, &self.encoding_key)
+            .map_err(|_| Status::internal("failed to sign provider assertion"))
+    }
+
     pub const fn token_ttl(&self) -> Duration {
         self.ttl
     }
