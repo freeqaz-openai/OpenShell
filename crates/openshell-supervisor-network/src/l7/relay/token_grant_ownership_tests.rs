@@ -24,7 +24,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, DuplexStream, ReadBuf};
@@ -1165,6 +1165,101 @@ fn assert_cache_acquisitions(resolver: &CachedTokenGrantResolver, expected: &[(&
         })
         .collect::<Vec<_>>();
     assert_eq!(resolver.acquisitions(), expected, "actual cache misses");
+}
+
+const REQUEST_AUTHORIZER: &str = "test/request-authorizer";
+
+#[derive(Default)]
+struct RequestAuthorizer {
+    evaluations: AtomicUsize,
+}
+
+#[tonic::async_trait]
+impl openshell_core::middleware::InProcessMiddleware for RequestAuthorizer {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+            SupervisorMiddlewarePhase,
+        };
+        MiddlewareManifest {
+            name: REQUEST_AUTHORIZER.into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 8192,
+                request_timeout: None,
+            }],
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
+            ..Default::default()
+        }
+    }
+
+    async fn validate_config(&self, _name: &str, _config: &prost_types::Struct) -> Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: openshell_core::middleware::HttpRequestView<'_>,
+    ) -> Result<openshell_core::proto::HttpRequestResult> {
+        use openshell_core::proto::{Decision, HttpRequestResult};
+        let evaluation = self.evaluations.fetch_add(1, Ordering::SeqCst);
+        Ok(HttpRequestResult {
+            decision: if evaluation < 2 {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            } as i32,
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn warm_grant_still_requires_middleware_allow_on_each_keepalive_request() {
+    let mut fixture = refresh_fixture(true);
+    let mut policy: serde_json::Value = serde_json::from_str(&fixture.policy_data).unwrap();
+    policy["network_middlewares"] = serde_json::json!({
+        "authorize": {
+            "middleware": REQUEST_AUTHORIZER,
+            "on_error": "fail_closed",
+            "endpoints": {"include": [HOST]}
+        }
+    });
+    fixture.policy_data = policy.to_string();
+    fixture.reload_policy();
+    let authorizer = Arc::new(RequestAuthorizer::default());
+    fixture.engine.set_middleware_runner_for_tests(
+        openshell_supervisor_middleware::ChainRunner::new(authorizer.clone()),
+    );
+    let resolver = Arc::new(CachedTokenGrantResolver::new());
+    let mut connection = fixture.connect_with_resolver(resolver.clone());
+
+    // The third middleware invocation denies with the same warm grant and connection.
+    for status in ["HTTP/1.1 204 ", "HTTP/1.1 204 ", "HTTP/1.1 403 "] {
+        let response = connection.exchange("GET", "/a/item", false).await;
+        assert!(response.starts_with(status), "{response}");
+    }
+    let capture = connection.finish().await;
+
+    assert_eq!(authorizer.evaluations.load(Ordering::SeqCst), 3);
+    let key = fixture.grant_key("/a/**", "a");
+    assert_cache_acquisitions(&resolver, &[(&key, "aud-old")]);
+    assert_eq!(capture.requests.len(), 2);
+    for request in &capture.requests {
+        assert_authorization(request, "aud-old-1");
+    }
+    assert_eq!(
+        capture.bytes_seen,
+        capture.requests.iter().map(String::len).sum::<usize>(),
+        "the denied request must not send even a partial header upstream"
+    );
 }
 
 #[tokio::test]
