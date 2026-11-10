@@ -1647,6 +1647,65 @@ mod provider_environment_tests {
     }
 }
 
+/// Obtain a dedicated provider assertion over the supervisor's authenticated
+/// gateway channel. This method never sends a session bearer to a provider.
+pub async fn mint_provider_client_assertion(
+    gateway: &GatewayEndpoint,
+    body: crate::proto::MintProviderClientAssertionRequest,
+    request_id: &str,
+) -> std::result::Result<String, TokenGrantFailure> {
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
+    if endpoint.scheme() != "https"
+        || body.expected_provider_id.is_empty()
+        || !crate::provider_credentials::provider_assertion_endpoint(&body.token_endpoint)
+    {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
+    let expected_provider_id = body.expected_provider_id.clone();
+    let mut request = tonic::Request::new(body);
+    if let Ok(id) = request_id.parse() {
+        request.metadata_mut().insert("x-request-id", id);
+    }
+    let response = client
+        .mint_provider_client_assertion(request)
+        .await
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+        .into_inner();
+    provider_client_assertion_response(&expected_provider_id, response)
+}
+
+fn provider_client_assertion_response(
+    expected_provider_id: &str,
+    response: crate::proto::MintProviderClientAssertionResponse,
+) -> std::result::Result<String, TokenGrantFailure> {
+    if expected_provider_id.is_empty() || response.bound_provider_id != expected_provider_id {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    if response.client_assertion.is_empty() {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Unclassified));
+    }
+    Ok(response.client_assertion)
+}
+
+#[cfg(test)]
+mod provider_assertion_response_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_missing_or_different_gateway_binding() {
+        for bound_provider_id in ["", "replacement"] {
+            let response = crate::proto::MintProviderClientAssertionResponse {
+                client_assertion: "synthetic-assertion".into(),
+                bound_provider_id: bound_provider_id.into(),
+            };
+            assert!(provider_client_assertion_response("installed", response).is_err());
+        }
+    }
+}
+
 /// Exchange a provider credential without retaining gateway diagnostics.
 ///
 /// Only a verified TLS connection can establish the provenance of a precise
