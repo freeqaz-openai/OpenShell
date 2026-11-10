@@ -20,3 +20,13 @@ Let a provider opt into OAuth client credentials using a short-lived JWT minted 
 ## Delivery
 
 Publish a proposal branch on the existing fork for upstream discussion. Keep EKS promotion separate. Before enabling this mode there, qualify the intended broker with the built Gateway and supervisor on a disposable local installation and verify model and Git behavior through the same Agent.
+
+## Reproduce the wire check locally
+
+From the repository root, run:
+
+```sh
+cargo test --locked -p openshell-supervisor-network --lib provider_client_assertion_wire
+```
+
+The test starts a loopback TLS Gateway and OAuth broker, then runs the supervisor relay without a SPIFFE socket. The broker reads the Gateway's public signing keys and checks the assertion. The relay's workload and origin fixtures use in-memory streams. The test checks the returned bearer header and verifies that rejected requests do not reach the origin. Production broker interoperability and sandbox isolation in an installed cluster require a separate rehearsal.
