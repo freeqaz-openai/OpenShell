@@ -13,13 +13,14 @@ use metrics::{counter, gauge};
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
 use openshell_core::policy_identity::canonical_rule_bytes;
-use openshell_core::proto::{NetworkPolicyRule, ProviderCredentialTokenGrantType, ProviderProfile};
+use openshell_core::proto::{NetworkPolicyRule, ProviderProfile};
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
 };
 use openshell_providers::{
-    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id, validate_profile_set,
+    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id,
+    unknown_token_grant_type_diagnostic, validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
@@ -724,25 +725,6 @@ fn scope_to_string(scope: ProfileScope) -> &'static str {
         ProfileScope::Platform => "platform",
         ProfileScope::Workspace => "workspace",
     }
-}
-
-/// Check the raw profile before conversion can default an unknown grant to client credentials.
-pub(crate) fn unknown_token_grant_type_diagnostic(
-    source: &str,
-    profile: &ProviderProfile,
-) -> Option<ProfileValidationDiagnostic> {
-    let index = profile.credentials.iter().position(|credential| {
-        credential.token_grant.as_ref().is_some_and(|grant| {
-            ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
-        })
-    })?;
-    Some(ProfileValidationDiagnostic {
-        source: source.to_string(),
-        profile_id: profile.id.clone(),
-        field: format!("credentials[{index}].token_grant.grant_type"),
-        message: "unknown provider token grant type".to_string(),
-        severity: "error".to_string(),
-    })
 }
 
 fn build_effective_profiles(

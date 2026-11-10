@@ -16,7 +16,6 @@ use crate::persistence::{
 use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
-    unknown_token_grant_type_diagnostic,
 };
 use crate::provider_refresh::RefreshStateReader;
 use crate::storage_proto::{
@@ -3845,7 +3844,9 @@ fn profiles_from_import_items(
                 });
             }
         }
-        if let Some(diagnostic) = unknown_token_grant_type_diagnostic(&source, profile) {
+        if let Some(diagnostic) =
+            openshell_providers::unknown_token_grant_type_diagnostic(&source, profile)
+        {
             diagnostics.push(diagnostic);
             continue;
         }

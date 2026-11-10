@@ -33,7 +33,7 @@ use openshell_core::{
 };
 use openshell_server::{
     TlsAcceptor,
-    test_support::provider_grant::{PROVIDER_ID, ProviderGrantGateway, SANDBOX},
+    test_support::provider_grant::{PROVIDER_ID, ProviderGrantGateway, SANDBOX, SIBLING},
 };
 use serde::Deserialize;
 use tokio::{
@@ -177,6 +177,9 @@ async fn run(cert_dir: &Path) {
 
     // Relay a request with an authentic credential for the wrong sandbox. It
     // must fail before the broker sees a request or the origin receives bytes.
+    fetch_provider_environment(&gateway.sibling, SIBLING)
+        .await
+        .expect("sibling session authenticates for its own sandbox");
     let (response, origin) = relay(&engine, &state, &binary, &gateway.sibling, placeholder).await;
     assert!(
         response.starts_with("HTTP/1.1 502 "),
@@ -205,14 +208,14 @@ async fn run(cert_dir: &Path) {
     assert!(!origin.contains(PLACEHOLDER_VALUE));
     broker.assert_outcomes(&[Outcome::Issued]);
 
-    broker.state.observations.lock().unwrap().reject = true;
+    *broker.state.audience.lock().unwrap() = format!("{broker_url}/other");
     let (response, origin) = relay(&engine, &state, &binary, &gateway.sandbox, placeholder).await;
     assert!(
         response.starts_with("HTTP/1.1 502 "),
         "expected broker refusal"
     );
     assert!(origin.is_empty(), "broker refusal reached the origin");
-    broker.assert_outcomes(&[Outcome::Issued, Outcome::Rejected]);
+    broker.assert_outcomes(&[Outcome::Issued, Outcome::WrongAudience]);
 }
 
 fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
@@ -319,7 +322,7 @@ async fn relay(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Outcome {
     Issued,
-    Rejected,
+    WrongAudience,
     InvalidRequest,
     InvalidAssertion,
 }
@@ -336,7 +339,7 @@ impl Drop for Broker {
 }
 
 struct BrokerState {
-    audience: String,
+    audience: Mutex<String>,
     key_id: String,
     public_key: DecodingKey,
     observations: Mutex<BrokerObservations>,
@@ -344,7 +347,6 @@ struct BrokerState {
 
 #[derive(Default)]
 struct BrokerObservations {
-    reject: bool,
     outcomes: Vec<Outcome>,
 }
 
@@ -372,7 +374,7 @@ impl Broker {
             panic!("expected one Gateway verification key");
         };
         let state = Arc::new(BrokerState {
-            audience: audience.into(),
+            audience: Mutex::new(audience.into()),
             key_id: jwk.common.key_id.clone().expect("Gateway key ID"),
             public_key: DecodingKey::from_jwk(jwk).expect("Gateway verification key"),
             observations: Mutex::default(),
@@ -476,7 +478,7 @@ impl BrokerState {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = 0;
         validation.set_issuer(&[GATEWAY_ISSUER]);
-        validation.set_audience(&[&self.audience]);
+        validation.set_audience(&[self.audience.lock().unwrap().as_str()]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
         let token = match openshell_crypto::jwt::decode::<AssertionClaims>(
             &form.client_assertion,
@@ -484,6 +486,9 @@ impl BrokerState {
             &validation,
         ) {
             Ok(token) => token,
+            Err(error) if error.kind() == &jsonwebtoken::errors::ErrorKind::InvalidAudience => {
+                return Outcome::WrongAudience;
+            }
             Err(_) => return Outcome::InvalidAssertion,
         };
         let claims = token.claims;
@@ -498,10 +503,6 @@ impl BrokerState {
             return Outcome::InvalidAssertion;
         }
 
-        if self.observations.lock().unwrap().reject {
-            Outcome::Rejected
-        } else {
-            Outcome::Issued
-        }
+        Outcome::Issued
     }
 }

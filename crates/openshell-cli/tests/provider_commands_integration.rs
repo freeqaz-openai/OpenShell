@@ -4544,6 +4544,56 @@ async fn provider_profile_gateway_assertion_negotiates_support_and_round_trips()
 }
 
 #[tokio::test]
+async fn unknown_gateway_grant_cannot_be_exported_or_used_to_create_a_provider() {
+    let ts = run_server().await;
+    let mut profile = openshell_providers::parse_profile_yaml(
+        "id: future-grant\ndisplay_name: Future grant\ncredentials:\n  - name: access\n    token_grant:\n      token_endpoint: https://issuer.example/token\n",
+    ).unwrap().to_proto();
+    profile.credentials[0]
+        .token_grant
+        .as_mut()
+        .unwrap()
+        .grant_type = 77;
+    ts.state
+        .profiles
+        .lock()
+        .await
+        .insert(profile.id.clone(), profile);
+
+    let error =
+        run::provider_profile_export_text(&ts.endpoint, "future-grant", "yaml", "default", &ts.tls)
+            .await
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown provider token grant type")
+    );
+    let error = run::provider_list_profiles_text(&ts.endpoint, "json", "default", &ts.tls)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown provider token grant type")
+    );
+    run::provider_create(
+        &ts.endpoint,
+        "future-instance",
+        "future-grant",
+        false,
+        &[],
+        false,
+        &[],
+        "default",
+        &ts.tls,
+    )
+    .await
+    .unwrap_err();
+    assert!(ts.state.providers.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn provider_profile_cli_run_functions_support_custom_profiles() {
     let ts = run_server().await;
     let dir = helpers::tempdir().unwrap();

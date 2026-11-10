@@ -183,6 +183,25 @@ pub enum TokenGrantAssertionSource {
 pub const GATEWAY_ASSERTION_PROFILE_CAPABILITY: &str =
     "openshell-profile-openshell-gateway-assertion-source";
 
+/// Check the raw profile before conversion can default an unknown grant to client credentials.
+pub fn unknown_token_grant_type_diagnostic(
+    source: &str,
+    profile: &ProviderProfile,
+) -> Option<ProfileValidationDiagnostic> {
+    let index = profile.credentials.iter().position(|credential| {
+        credential.token_grant.as_ref().is_some_and(|grant| {
+            ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
+        })
+    })?;
+    Some(ProfileValidationDiagnostic {
+        source: source.to_string(),
+        profile_id: profile.id.clone(),
+        field: format!("credentials[{index}].token_grant.grant_type"),
+        message: "unknown provider token grant type".to_string(),
+        severity: "error".to_string(),
+    })
+}
+
 /// Whether a wire profile requires a reader that preserves the identity source.
 #[must_use]
 pub fn profile_uses_gateway_assertion(profile: &ProviderProfile) -> bool {
