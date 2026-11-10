@@ -217,6 +217,7 @@ pub(crate) async fn prepare_inspected_request(
             &scoped,
             snapshot,
             &owners,
+            config,
             request_id,
             observation_context.filter(|context| {
                 context.matches_config(&config.policy_hash, Some(snapshot.revision))

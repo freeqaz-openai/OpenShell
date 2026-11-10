@@ -78,6 +78,15 @@ fn basic_auth_token(value: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Format an HTTP Basic authorization value from a validated `user:password` pair.
+#[must_use]
+pub fn format_basic_auth_header(user_password: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(user_password)
+    )
+}
+
 fn decode_basic_auth_value(value: &str) -> Option<String> {
     decode_basic_auth_token(basic_auth_token(value)?)
 }
@@ -685,9 +694,9 @@ impl SecretResolver {
         // Basic auth decoding: `Basic <base64>` where the decoded content
         // contains a placeholder (e.g. `user:openshell:resolve:env:PASS`).
         if let Some(encoded) = basic_auth_token(trimmed)
-            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)?
+            && let Some(rewritten) = self.rewrite_basic_auth_header(encoded)?
         {
-            return Ok(Some(format!("Basic {rewritten}")));
+            return Ok(Some(rewritten));
         }
 
         // Prefixed placeholder: `Bearer openshell:resolve:env:KEY`
@@ -825,11 +834,10 @@ impl SecretResolver {
     /// the decoded `username:password` string, and re-encode.
     ///
     /// Returns `None` if decoding fails or no placeholders are found.
-    fn rewrite_basic_auth_token(
+    fn rewrite_basic_auth_header(
         &self,
         encoded: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
-        let b64 = base64::engine::general_purpose::STANDARD;
         let Some(decoded) = decode_basic_auth_token(encoded.trim()) else {
             return Ok(None);
         };
@@ -845,7 +853,7 @@ impl SecretResolver {
             return Ok(None);
         }
 
-        Ok(Some(b64.encode(rewritten.as_bytes())))
+        Ok(Some(format_basic_auth_header(&rewritten)))
     }
 }
 
