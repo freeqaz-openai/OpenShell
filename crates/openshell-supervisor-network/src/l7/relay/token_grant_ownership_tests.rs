@@ -8,6 +8,8 @@
 //! or that a real OAuth server issues the requested token. The resolver returns
 //! inert values and records which provider and audience the relay requested.
 
+mod provider_client_assertion_wire;
+
 use super::*;
 use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
 use crate::opa::{NetworkInput, OpaEngine};
