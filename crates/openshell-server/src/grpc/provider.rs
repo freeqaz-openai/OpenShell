@@ -16,6 +16,7 @@ use crate::persistence::{
 use crate::provider_profile_sources::{
     EffectiveProviderProfileCatalog, ProfileScope, ProviderProfileSources,
     profile_response_payload, profile_storage_payload, stored_profile_resource_version,
+    unknown_token_grant_type_diagnostic,
 };
 use crate::provider_refresh::RefreshStateReader;
 use crate::storage_proto::{
@@ -3773,19 +3774,8 @@ fn profiles_from_import_items(
                 });
             }
         }
-        // Profile conversion defaults unknown grant types to client credentials.
-        if let Some(index) = profile.credentials.iter().position(|credential| {
-            credential.token_grant.as_ref().is_some_and(|grant| {
-                ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
-            })
-        }) {
-            diagnostics.push(ProfileValidationDiagnostic {
-                source,
-                profile_id: profile.id.clone(),
-                field: format!("credentials[{index}].token_grant.grant_type"),
-                message: "unknown provider token grant type".to_string(),
-                severity: "error".to_string(),
-            });
+        if let Some(diagnostic) = unknown_token_grant_type_diagnostic(&source, profile) {
+            diagnostics.push(diagnostic);
             continue;
         }
         profiles.push((source, ProviderTypeProfile::from_proto(profile)));
