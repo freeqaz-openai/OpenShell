@@ -2453,7 +2453,7 @@ fn push_dynamic_token_grant_binding(
         provider_name: provider_name.to_string(),
         credential_name: credential.name.clone(),
         // The supervisor selects one grant per case-insensitive header, using
-        // Authorization when bearer placement omits an explicit destination.
+        // Authorization when bearer or Basic placement omits an explicit destination.
         header_name: if credential.header_name.trim().is_empty() {
             "authorization".to_string()
         } else {
