@@ -2,7 +2,7 @@
 
 ## Decision
 
-Let a provider opt into OAuth client credentials using a short-lived JWT minted by the OpenShell Gateway. Keep SPIFFE as the default and preserve the existing token-exchange flow. The workload uses its existing opaque placeholder. Only the supervisor contacts the token endpoint.
+Let a provider opt into OAuth client credentials using a short-lived JWT minted by the OpenShell Gateway. Keep SPIFFE as the default and preserve the existing token-exchange flow. Only the supervisor contacts the token endpoint. It injects the access token on admitted traffic. A grant-only profile can do this without an environment placeholder.
 
 ## Implementation
 
@@ -13,7 +13,7 @@ Let a provider opt into OAuth client credentials using a short-lived JWT minted 
 ## Local acceptance before EKS
 
 - Run existing SPIFFE and token-exchange regression cases.
-- Exercise the new normal supervisor path without a SPIFFE socket, using synthetic identities, a test Gateway and a local HTTPS broker. Verify the broker receives a valid assertion, issues a test access token, and the token reaches the intended upstream request. Ensure the workload sees only its placeholder. Record which boundaries the test actually exercises.
+- Exercise the new normal supervisor path without a SPIFFE socket, using synthetic identities, a test Gateway and a local HTTPS broker. Verify the broker receives a valid assertion, issues a test access token, and the token reaches the intended upstream request. Verify that neither the assertion nor the issued token reaches the workload. If the fixture supplies a placeholder, verify its replacement on the upstream request. Record which boundaries the test actually exercises.
 - Verify an unbound provider, wrong sandbox, unregistered recipient, wrong audience and expired assertion are refused at the owning boundary. Distinguish rejection before a request reaches the broker from rejection by the broker.
 - Check generated API bindings, formatting, compilation and independent review. Record any untested integration or known limitations alongside the patch.
 
