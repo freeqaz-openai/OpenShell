@@ -179,10 +179,14 @@ mod tests {
     // updates use a separate capability/service and add one classified RPC.
     // The provider assertion RPC adds two public messages; the grant type's
     // new enum value is also visible in persisted provider profiles.
+    // ProviderProfileCredential.token_grant_provider_id is additive in both
+    // closures. Prior profiles decode an empty value, and the gateway derives
+    // it from the provider record only when delivering a credential snapshot.
+    // Lint capability and mint request/response binding fields are public-only.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "928abbac8c9739f704fdb2acfe61b26da33b99c6b0751e4be88329ce366e9536";
+        "f12d359724ccecd1d9192d90fe6d9cef7b7d4f68dd6dd888475012b7abcd90fe";
     const DURABLE_SCHEMA_SHA256: &str =
-        "2ad8abe6918f33e62e4ad9bc5399e520823517275953c75661fb934255cef986";
+        "f2d90ebfec281aea99aae1216539d8672b6f0acc6b1d11e6d892973cc4239a44";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "c0c3ea17f105aaa6d843c466fd4240451c2105dce7675384935d4aaecdac8abf";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -810,6 +814,7 @@ mod tests {
         assert!(credential.required);
         assert_eq!(credential.auth_style, "bearer");
         assert!(!credential.stable_placeholder);
+        assert!(credential.token_grant_provider_id.is_empty());
     }
 
     #[test]
