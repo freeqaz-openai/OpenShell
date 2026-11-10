@@ -3032,12 +3032,8 @@ pub(super) async fn handle_list_provider_profiles(
         .map_err(|_| Status::internal("page_size does not fit usize"))?;
     let has_more = profiles.len() > page_size;
     profiles.truncate(page_size);
-    if !supports_gateway_assertion
-        && profiles
-            .iter()
-            .any(|(_, profile)| openshell_providers::profile_uses_gateway_assertion(profile))
-    {
-        return Err(gateway_assertion_profile_capability_required());
+    for (_, profile) in &profiles {
+        require_gateway_assertion_profile_capability(supports_gateway_assertion, profile)?;
     }
     let next_key = if has_more {
         profiles.last().map(|(key, _)| key.as_str())
@@ -3355,18 +3351,14 @@ fn supports_gateway_assertion_profiles<T>(request: &Request<T>) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-fn gateway_assertion_profile_capability_required() -> Status {
-    Status::failed_precondition(
-        "profile client does not support assertion_source openshell_gateway",
-    )
-}
-
 fn require_gateway_assertion_profile_capability(
     supported: bool,
     profile: &ProviderProfile,
 ) -> Result<(), Status> {
     if !supported && openshell_providers::profile_uses_gateway_assertion(profile) {
-        return Err(gateway_assertion_profile_capability_required());
+        return Err(Status::failed_precondition(
+            "profile client does not support assertion_source openshell_gateway",
+        ));
     }
     Ok(())
 }
@@ -8071,27 +8063,28 @@ mod tests {
         grant_type: i32,
     ) -> ProviderProfileImportItem {
         let mut profile = custom_profile(id);
+        let subject_credential = (grant_type
+            == ProviderCredentialTokenGrantType::TokenExchange as i32)
+            .then_some("subject_token");
         profile.credentials.push(ProviderProfileCredential {
             name: "access_token".into(),
             token_grant: Some(ProviderCredentialTokenGrant {
                 grant_type,
                 token_endpoint: "https://issuer.example/token".into(),
+                subject_token: subject_credential.map(|credential| {
+                    ProviderCredentialTokenGrantSubjectToken {
+                        source: "provider_credential".into(),
+                        credential: credential.into(),
+                        ..Default::default()
+                    }
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         });
-        if grant_type == ProviderCredentialTokenGrantType::TokenExchange as i32 {
-            profile.credentials[0]
-                .token_grant
-                .as_mut()
-                .unwrap()
-                .subject_token = Some(ProviderCredentialTokenGrantSubjectToken {
-                source: "provider_credential".into(),
-                credential: "subject_token".into(),
-                ..Default::default()
-            });
+        if let Some(name) = subject_credential {
             profile.credentials.push(ProviderProfileCredential {
-                name: "subject_token".into(),
+                name: name.into(),
                 ..Default::default()
             });
         }
@@ -8156,6 +8149,15 @@ mod tests {
         };
         use openshell_core::proto::open_shell_server::OpenShell;
 
+        fn capable_request<T>(inner: T) -> Request<T> {
+            let mut request = authed_request(inner);
+            request.metadata_mut().insert(
+                openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            request
+        }
+
         let service = crate::grpc::OpenShellService::new(test_server_state().await);
         let cases = [
             ("grant-legacy", Unspecified, ClientCredentials),
@@ -8181,19 +8183,16 @@ mod tests {
                 .code(),
             Code::FailedPrecondition,
         );
-        let mut import = authed_request(ImportProviderProfilesRequest {
-            profiles: cases
-                .iter()
-                .map(|(id, input, _)| provider_profile_import_item_with_grant(id, *input as i32))
-                .collect(),
-            ..Default::default()
-        });
-        import.metadata_mut().insert(
-            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
         let response = service
-            .import_provider_profiles(import)
+            .import_provider_profiles(capable_request(ImportProviderProfilesRequest {
+                profiles: cases
+                    .iter()
+                    .map(|(id, input, _)| {
+                        provider_profile_import_item_with_grant(id, *input as i32)
+                    })
+                    .collect(),
+                ..Default::default()
+            }))
             .await
             .unwrap()
             .into_inner();
@@ -8222,38 +8221,28 @@ mod tests {
             .as_mut()
             .unwrap()
             .grant_type = ClientCredentials as i32;
-        let mut stale_update = authed_request(UpdateProviderProfilesRequest {
-            id: stripped.id.clone(),
-            expected_resource_version: stripped.resource_version,
-            profile: Some(ProviderProfileImportItem {
-                profile: Some(stripped),
-                source: "stripped.yaml".into(),
-            }),
-            ..Default::default()
-        });
-        stale_update.metadata_mut().insert(
-            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
-            tonic::metadata::MetadataValue::from_static("1"),
-        );
         assert_eq!(
             service
-                .update_provider_profiles(stale_update)
+                .update_provider_profiles(capable_request(UpdateProviderProfilesRequest {
+                    id: stripped.id.clone(),
+                    expected_resource_version: stripped.resource_version,
+                    profile: Some(ProviderProfileImportItem {
+                        profile: Some(stripped),
+                        source: "stripped.yaml".into(),
+                    }),
+                    ..Default::default()
+                }))
                 .await
                 .unwrap_err()
                 .code(),
             Code::FailedPrecondition
         );
         for (id, _, expected) in cases {
-            let mut request = authed_request(GetProviderProfileRequest {
-                id: id.into(),
-                ..Default::default()
-            });
-            request.metadata_mut().insert(
-                openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
-                tonic::metadata::MetadataValue::from_static("1"),
-            );
             let profile = service
-                .get_provider_profile(request)
+                .get_provider_profile(capable_request(GetProviderProfileRequest {
+                    id: id.into(),
+                    ..Default::default()
+                }))
                 .await
                 .unwrap()
                 .into_inner()
