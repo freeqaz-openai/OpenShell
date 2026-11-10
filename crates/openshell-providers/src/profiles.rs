@@ -2729,7 +2729,32 @@ pub fn validate_profile_set(
             .credentials
             .iter()
             .any(|credential| credential.token_grant.is_some());
+        let has_basic_token_grant = profile.credentials.iter().any(|credential| {
+            credential.token_grant.is_some()
+                && credential.auth_style.trim().eq_ignore_ascii_case("basic")
+        });
+        if has_basic_token_grant && profile.endpoints.is_empty() {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "endpoints",
+                "basic token_grant credentials require a REST endpoint with TLS inspection",
+            ));
+        }
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
+            if has_basic_token_grant
+                && (L7Protocol::parse(&endpoint.protocol) != Some(L7Protocol::Rest)
+                    || !endpoint.tls.is_empty()
+                    || endpoint.allow_uninspected_credentials
+                    || !endpoint.credential_signing.is_empty())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("endpoints[{index}]"),
+                    "basic token_grant credentials require protocol: rest with TLS inspection and no credential signing",
+                ));
+            }
             if !endpoint_is_valid(endpoint) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -3654,7 +3679,18 @@ fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
 fn validate_token_grant_auth_style(credential: &CredentialProfile) -> Result<(), String> {
     match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" | "header" => Ok(()),
-        _ => Err("token_grant credentials support auth_style bearer or header".to_string()),
+        "basic"
+            if credential.query_param.trim().is_empty()
+                && credential.path_template.trim().is_empty()
+                && credential.refresh.is_none() =>
+        {
+            Ok(())
+        }
+        "basic" => Err(
+            "basic token_grant credentials cannot set query_param, path_template, or refresh"
+                .to_string(),
+        ),
+        _ => Err("token_grant credentials support auth_style bearer, header, or basic".to_string()),
     }
 }
 
@@ -3662,6 +3698,14 @@ fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<()
     let header_name = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" if credential.header_name.trim().is_empty() => "Authorization",
         "" | "bearer" | "header" => credential.header_name.trim(),
+        "basic" => {
+            let name = credential.header_name.trim();
+            return if name.is_empty() || name.eq_ignore_ascii_case("authorization") {
+                Ok(())
+            } else {
+                Err("basic token_grant credentials can only use Authorization".to_string())
+            };
+        }
         _ => return Ok(()),
     };
     if header_name.is_empty() {
@@ -5881,9 +5925,60 @@ credentials:
 
             assert_eq!(
                 diagnostic.message,
-                "token_grant credentials support auth_style bearer or header"
+                "token_grant credentials support auth_style bearer, header, or basic"
             );
         }
+    }
+
+    #[test]
+    fn basic_token_grant_requires_unambiguous_rest_tls_configuration() {
+        let mut profile = parse_profile_yaml(
+            r"
+id: git-token-grant
+display_name: Git Token Grant
+credentials:
+  - name: access_token
+    auth_style: basic
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      assertion_source: openshell_gateway
+endpoints:
+  - host: github.example.com
+    port: 443
+    path: /team/repo.git/**
+    protocol: rest
+    access: full
+",
+        )
+        .unwrap();
+        let lint = |profile: &ProviderTypeProfile| {
+            validate_profile_set(&[("git.yaml".to_string(), profile.clone())])
+        };
+        let expect_invalid = |profile: &ProviderTypeProfile, field: &str| {
+            let diagnostics = lint(profile);
+            assert!(
+                diagnostics.iter().any(|error| error.field == field),
+                "expected a diagnostic for {field}: {diagnostics:?}"
+            );
+        };
+        assert!(lint(&profile).is_empty(), "default Authorization is valid");
+        profile.credentials[0].header_name = "aUtHoRiZaTiOn".into();
+        assert!(lint(&profile).is_empty(), "explicit Authorization is valid");
+
+        let mut invalid = profile.clone();
+        invalid.credentials[0].header_name = "Proxy-Authorization".into();
+        expect_invalid(&invalid, "credentials.header_name");
+        let mut invalid = profile.clone();
+        invalid.credentials[0].query_param = "token".into();
+        expect_invalid(&invalid, "credentials.token_grant.auth_style");
+        let mut invalid = profile.clone();
+        invalid.endpoints[0].allow_uninspected_credentials = true;
+        expect_invalid(&invalid, "endpoints[0]");
+        let mut invalid = profile.clone();
+        invalid.endpoints[0].protocol.clear();
+        expect_invalid(&invalid, "endpoints[0]");
+        profile.endpoints[0].tls = "skip".into();
+        expect_invalid(&profile, "endpoints[0]");
     }
 
     #[test]

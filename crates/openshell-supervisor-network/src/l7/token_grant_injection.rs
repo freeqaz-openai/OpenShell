@@ -28,6 +28,7 @@ use tracing::warn;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+use crate::l7::{CredentialSigning, L7EndpointConfig, L7Protocol, TlsMode};
 use crate::telemetry::egress_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
@@ -181,7 +182,7 @@ pub async fn inject_for_selectors(
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
-    let selected = select_scoped(snapshot, ctx, request_path(&req.target), None);
+    let selected = select_scoped(snapshot, ctx, request_path(&req.target), None, false);
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
 
@@ -197,6 +198,7 @@ pub(super) async fn inject_for_admitted_owners(
     ctx: &L7EvalContext,
     snapshot: &ProviderCredentialSnapshot,
     admitted_owners: &HashSet<String>,
+    config: &L7EndpointConfig,
     request_id: &str,
     observation_context: Option<&EndpointObservationContext>,
 ) -> Result<L7Request, TokenGrantInjectionError> {
@@ -218,7 +220,20 @@ pub(super) async fn inject_for_admitted_owners(
             key,
         ))
     } else {
-        select_scoped(snapshot, ctx, request_path, Some(admitted_owners))
+        // A configured port alone cannot establish TLS. The HTTP transport
+        // sets its authority default after detecting TLS or selecting HTTPS.
+        let basic_allowed = config.protocol == L7Protocol::Rest
+            && config.tls == TlsMode::Auto
+            && !config.allow_uninspected_credentials
+            && config.credential_signing == CredentialSigning::None
+            && ctx.request_default_port == Some(443);
+        select_scoped(
+            snapshot,
+            ctx,
+            request_path,
+            Some(admitted_owners),
+            basic_allowed,
+        )
     };
     inject_or_report(req, ctx, selected, request_id, observation_context).await
 }
@@ -228,6 +243,7 @@ fn select_scoped(
     ctx: &L7EvalContext,
     request_path: &str,
     admitted_owners: Option<&HashSet<String>>,
+    basic_allowed: bool,
 ) -> Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError> {
     let candidates = token_grant_candidates(
         &snapshot.dynamic_credentials,
@@ -235,7 +251,7 @@ fn select_scoped(
         request_path,
         admitted_owners,
     )?;
-    Ok(select_token_grants(candidates)?
+    Ok(select_token_grants(candidates, basic_allowed)?
         .into_iter()
         .map(|(key, credential)| (snapshot.scoped_key(&key), credential))
         .collect())
@@ -437,6 +453,7 @@ fn injection_configuration_failure() -> TokenGrantFailure {
 
 fn select_token_grants(
     mut candidates: Vec<(u32, String, ProviderProfileCredential)>,
+    basic_allowed: bool,
 ) -> Result<Vec<(String, ProviderProfileCredential)>, TokenGrantInjectionError> {
     // Examine the strongest bindings first. The complete binding key stays with
     // its grant because the resolver uses it to separate cache entries and revisions.
@@ -446,6 +463,9 @@ fn select_token_grants(
         let refused =
             || TokenGrantInjectionError::for_binding(injection_configuration_failure(), &key);
         let identity = credential_identity(&key).ok_or_else(refused)?;
+        if credential.auth_style.trim().eq_ignore_ascii_case("basic") && !basic_allowed {
+            return Err(refused());
+        }
         let header = token_grant_header_name(&credential)
             .map_err(|_| refused())?
             .to_ascii_lowercase();
@@ -606,10 +626,12 @@ fn token_grant_header(
     access_token: &str,
 ) -> Result<(String, String), TokenGrantFailure> {
     let header_name = token_grant_header_name(credential)?;
-    let header_value = if credential.auth_style.trim().eq_ignore_ascii_case("header") {
-        access_token.to_string()
-    } else {
-        format!("Bearer {access_token}")
+    let header_value = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
+        "header" => access_token.to_string(),
+        "basic" => openshell_core::secrets::format_basic_auth_header(&format!(
+            "x-access-token:{access_token}"
+        )),
+        _ => format!("Bearer {access_token}"),
     };
     Ok((header_name.to_string(), header_value))
 }
@@ -624,6 +646,18 @@ fn token_grant_header_name(
             } else {
                 credential.header_name.trim()
             }
+        }
+        "basic"
+            if (credential.header_name.trim().is_empty()
+                || credential
+                    .header_name
+                    .trim()
+                    .eq_ignore_ascii_case("authorization"))
+                && credential.query_param.trim().is_empty()
+                && credential.path_template.trim().is_empty()
+                && credential.refresh.is_none() =>
+        {
+            "Authorization"
         }
         // Header auth names its own header; there is no default to fall back to.
         "header" if !credential.header_name.trim().is_empty() => credential.header_name.trim(),

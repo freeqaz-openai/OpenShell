@@ -69,6 +69,40 @@ async fn malformed_endpoint_key_fails_before_acquisition() {
 }
 
 #[tokio::test]
+async fn basic_grant_requires_an_admitted_inspected_route() {
+    let (fixture, mut ctx) = fixture(Ok("identity-token"));
+    fixture
+        .dynamic_credentials()
+        .write()
+        .unwrap()
+        .get_mut(SERVICE)
+        .unwrap()
+        .auth_style = "basic".into();
+    let state = fixture.provider_credentials();
+    ctx.provider_credentials = Some(state.clone());
+    ctx.request_default_port = Some(443);
+
+    assert!(inject_if_needed(request(), &ctx, REQUEST_ID).await.is_err());
+    fixture.assert_no_requests();
+    let owners = HashSet::from(["test-owner".to_owned()]);
+    let endpoint = regorus::Value::from_json_str(r#"{"protocol":"rest"}"#).unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
+    let admitted = inject_for_admitted_owners(
+        request(),
+        &ctx,
+        &state.snapshot(),
+        &owners,
+        &config,
+        REQUEST_ID,
+        None,
+    )
+    .await
+    .unwrap();
+    let headers = String::from_utf8(admitted.raw_header).unwrap();
+    assert!(headers.contains("Authorization: Basic eC1hY2Nlc3MtdG9rZW46c2VydmljZS10b2tlbg==\r\n"));
+}
+
+#[tokio::test]
 async fn injects_independent_grants_and_replaces_all_protected_headers() {
     let (fixture, ctx) = fixture(Ok("identity-token"));
     let rewritten = inject_if_needed(request(), &ctx, REQUEST_ID).await.unwrap();
@@ -310,6 +344,8 @@ async fn admitted_owners_select_grants_independently_per_header() {
         (&["identity-owner"], false, true),
         (&["test-owner", "identity-owner"], true, true),
     ];
+    let endpoint = regorus::Value::from_json_str(r#"{"protocol":"rest"}"#).unwrap();
+    let config = crate::l7::parse_l7_config(&endpoint).unwrap();
     for (admitted, service, identity) in cases {
         let (fixture, mut ctx) = fixture(Ok("identity-token"));
         fixture
@@ -331,6 +367,7 @@ async fn admitted_owners_select_grants_independently_per_header() {
             &ctx,
             &state.snapshot(),
             &owners,
+            &config,
             REQUEST_ID,
             None,
         )
