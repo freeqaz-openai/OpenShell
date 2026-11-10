@@ -1182,6 +1182,106 @@ fn assert_cache_acquisitions(resolver: &CachedTokenGrantResolver, expected: &[(&
     assert_eq!(resolver.acquisitions(), expected, "actual cache misses");
 }
 
+// HTTP middleware decisions can change independently of installed network policy and grants.
+struct RequestAuthorizer {
+    allow: AtomicBool,
+    evaluations: std::sync::atomic::AtomicUsize,
+}
+
+#[tonic::async_trait]
+impl openshell_core::middleware::InProcessMiddleware for RequestAuthorizer {
+    async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+        use openshell_core::proto::{
+            MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+            SupervisorMiddlewarePhase,
+        };
+        MiddlewareManifest {
+            name: "test/request-authorizer".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                max_payload_bytes: 8192,
+                request_timeout: None,
+            }],
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
+            ..Default::default()
+        }
+    }
+
+    async fn validate_config(&self, _name: &str, _config: &prost_types::Struct) -> Result<()> {
+        Ok(())
+    }
+
+    async fn evaluate_http_request(
+        &self,
+        _request: openshell_core::middleware::HttpRequestView<'_>,
+    ) -> Result<openshell_core::proto::HttpRequestResult> {
+        use openshell_core::proto::{Decision, HttpRequestResult};
+        self.evaluations.fetch_add(1, Ordering::SeqCst);
+        let decision = if self.allow.load(Ordering::SeqCst) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        };
+        Ok(HttpRequestResult {
+            decision: decision as i32,
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn warm_grant_still_requires_middleware_allow_on_each_keepalive_request() {
+    let mut fixture = refresh_fixture(true);
+    let mut policy: serde_json::Value = serde_json::from_str(&fixture.policy_data).unwrap();
+    policy["network_middlewares"] = serde_json::json!({
+        "authorize": {
+            "middleware": "test/request-authorizer",
+            "on_error": "fail_closed",
+            "endpoints": {"include": [HOST]}
+        }
+    });
+    fixture.policy_data = policy.to_string();
+    fixture.reload_policy();
+    let authorizer = Arc::new(RequestAuthorizer {
+        allow: AtomicBool::new(true),
+        evaluations: 0.into(),
+    });
+    fixture.engine.set_middleware_runner_for_tests(
+        openshell_supervisor_middleware::ChainRunner::new(authorizer.clone()),
+    );
+    let resolver = Arc::new(CachedTokenGrantResolver::new());
+    let mut connection = fixture.connect_with_resolver(resolver.clone());
+
+    for _ in 0..2 {
+        let response = connection.exchange("GET", "/a/item", false).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+    }
+    authorizer.allow.store(false, Ordering::SeqCst);
+    let response = connection.exchange("GET", "/a/item", false).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let capture = connection.finish().await;
+
+    assert_eq!(authorizer.evaluations.load(Ordering::SeqCst), 3);
+    let key = fixture.grant_key("/a/**", "a");
+    assert_cache_acquisitions(&resolver, &[(&key, "aud-old")]);
+    assert_eq!(capture.requests.len(), 2);
+    for request in &capture.requests {
+        assert_authorization(request, "aud-old-1");
+    }
+    assert_eq!(
+        capture.bytes_seen,
+        capture.requests.iter().map(String::len).sum::<usize>(),
+        "the denied request must not send even a partial header upstream"
+    );
+}
+
 #[tokio::test]
 async fn route_selected_connection_reuses_then_reacquires_expired_cached_grant() {
     let fixture = refresh_fixture(true);
