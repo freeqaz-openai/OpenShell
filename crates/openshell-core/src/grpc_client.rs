@@ -1647,6 +1647,38 @@ mod provider_environment_tests {
     }
 }
 
+/// Obtain a dedicated provider assertion over the supervisor's authenticated
+/// gateway channel. This method never sends a session bearer to a provider.
+pub async fn mint_provider_client_assertion(
+    gateway: &GatewayEndpoint,
+    body: crate::proto::MintProviderClientAssertionRequest,
+    request_id: &str,
+) -> std::result::Result<String, TokenGrantFailure> {
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
+    if endpoint.scheme() != "https"
+        || !crate::provider_credentials::provider_assertion_endpoint(&body.token_endpoint)
+    {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
+    let mut request = tonic::Request::new(body);
+    if let Ok(id) = request_id.parse() {
+        request.metadata_mut().insert("x-request-id", id);
+    }
+    let assertion = client
+        .mint_provider_client_assertion(request)
+        .await
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+        .into_inner()
+        .client_assertion;
+    if assertion.is_empty() {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Unclassified));
+    }
+    Ok(assertion)
+}
+
 /// Exchange a provider credential without retaining gateway diagnostics.
 ///
 /// Only a verified TLS connection can establish the provenance of a precise

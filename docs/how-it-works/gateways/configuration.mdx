@@ -529,6 +529,23 @@ allow_unauthenticated_users = true
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
+## Provider client assertions
+
+To use a provider profile with `grant_type: openshell_client_credentials`, configure gateway JWT signing, enable TLS on the supervisor-to-gateway connection, and register the provider instance and credential in the gateway configuration. Set the same canonical HTTPS URL, including the path, in the profile and registration. Omit user information, query parameters and fragments. Leave `jwt_svid_audience` and `client_assertion_type` unset.
+
+```toml
+[[openshell.gateway.provider_assertions]]
+provider_id = "<immutable provider ID>"
+credential_key = "access_token"
+token_endpoint = "https://issuer.example/oauth/token"
+```
+
+The gateway authorizes the authenticated sandbox against its current provider attachment and profile. The supervisor submits a 60-second JWT in the OAuth2 `client_assertion` form field. The token service must verify the signature using the configured gateway's JWKS, require EdDSA and type `openshell-provider-assertion+jwt`, and verify the expected issuer (`iss`), exact token endpoint audience (`aud`), and expiration. Require `caller_kind=supervisor` and a subject of `openshell-sandbox:<sandbox_id>` that matches the `sandbox_id` claim. Reject replayed assertion IDs (`jti`) through expiry.
+
+Before issuing an access token, the token service must find an authorization rule that matches the verified issuer, supervisor sandbox identity, immutable `provider_id`, and `credential_key`. The same rule must allow the resource audience and every scope requested in the OAuth2 form. Apply that rule to any defaults for omitted values as well.
+
+Keep this mode out of provider profiles during mixed-version upgrades. Older gateways can interpret the new enum as SPIFFE client credentials, and older supervisors reject it if they receive it. After upgrading all gateway replicas, supervisors, and profile tooling that handle these profiles, register the provider on every gateway replica before importing or serving profiles with this mode. Remove this mode from active profiles and remove the registrations from gateway configuration before rolling back. Older gateways reject the new configuration field.
+
 ## Service Routing
 
 Sandbox service URLs default to a readable composite hostname:

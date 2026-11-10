@@ -403,7 +403,9 @@ pub struct ServerState {
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
-    /// Typed extension JWT issuer and public verification metadata.
+    /// Operator registrations for outbound provider client assertions.
+    pub provider_assertions: Vec<config_file::ProviderAssertionRegistration>,
+    /// Signing authority and public verification metadata for outbound JWTs.
     pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
     /// Launch-scoped gateway and Sandbox Protocol token authority.
@@ -673,6 +675,7 @@ impl ServerState {
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
+            provider_assertions: Vec::new(),
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
@@ -964,6 +967,11 @@ pub(crate) async fn run_server(
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
+    if let Some(file) = config_file.as_ref() {
+        state
+            .provider_assertions
+            .clone_from(&file.openshell.gateway.provider_assertions);
+    }
     state.extension_jwt_issuer = extension_jwt_issuer.clone();
     state.sandbox_session_jwt_authority = sandbox_session_jwt_authority;
     if let Some(issuer) = extension_jwt_issuer {

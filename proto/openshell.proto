@@ -548,6 +548,12 @@ service OpenShell {
     };
   }
 
+  // Mint a short-lived client assertion for one attached provider credential.
+  rpc MintProviderClientAssertion(MintProviderClientAssertionRequest)
+      returns (MintProviderClientAssertionResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "sandbox" };
+  }
+
   // Exchange a stored provider subject token for an intermediate token scoped
   // to the calling supervisor's SPIFFE identity.
   rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
@@ -2398,6 +2404,8 @@ enum ProviderCredentialTokenGrantType {
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
   PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+  // OAuth2 client_credentials using a gateway-signed supervisor assertion.
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_OPENSHELL_CLIENT_CREDENTIALS = 3;
 }
 
 message ProviderCredentialTokenGrantSubjectToken {
@@ -2873,6 +2881,20 @@ message ProviderEnvironmentSnapshot {
   ProviderReadinessReason readiness_reason = 6;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 7;
+}
+
+message MintProviderClientAssertionRequest {
+  // The per-sandbox supervisor's authenticated, immutable sandbox ID.
+  string sandbox_id = 1;
+  string provider = 2;
+  string credential_key = 3;
+  // Expected value from the supervisor's snapshot. The gateway checks its
+  // current profile and operator registration before minting.
+  string token_endpoint = 4;
+}
+
+message MintProviderClientAssertionResponse {
+  string client_assertion = 1 [(openshell.options.v1.secret) = true];
 }
 
 message ExchangeProviderSubjectTokenRequest {

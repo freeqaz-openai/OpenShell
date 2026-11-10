@@ -1432,6 +1432,9 @@ pub fn provider_refresh_strategy_to_yaml(
 pub fn provider_token_grant_type_from_yaml(raw: &str) -> Option<ProviderCredentialTokenGrantType> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "" | "client_credentials" => Some(ProviderCredentialTokenGrantType::ClientCredentials),
+        "openshell_client_credentials" => {
+            Some(ProviderCredentialTokenGrantType::OpenshellClientCredentials)
+        }
         "token_exchange" => Some(ProviderCredentialTokenGrantType::TokenExchange),
         _ => None,
     }
@@ -1442,6 +1445,9 @@ pub fn provider_token_grant_type_to_yaml(
     grant_type: ProviderCredentialTokenGrantType,
 ) -> &'static str {
     match grant_type {
+        ProviderCredentialTokenGrantType::OpenshellClientCredentials => {
+            "openshell_client_credentials"
+        }
         ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
         ProviderCredentialTokenGrantType::ClientCredentials
         | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
@@ -3293,7 +3299,19 @@ fn validate_token_grant_subject_token(
     let mut diagnostics = Vec::new();
 
     match grant_type {
-        ProviderCredentialTokenGrantType::ClientCredentials => {
+        ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::OpenshellClientCredentials => {
+            if grant_type == ProviderCredentialTokenGrantType::OpenshellClientCredentials
+                && (!openshell_core::provider_credentials::provider_assertion_endpoint(
+                    &token_grant.token_endpoint,
+                ) || !token_grant.jwt_svid_audience.is_empty()
+                    || !token_grant.client_assertion_type.is_empty())
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source, profile_id, "credentials.token_grant",
+                    "openshell_client_credentials requires a canonical HTTPS token_endpoint and default assertion type and audience",
+                ));
+            }
             if token_grant.subject_token.is_some() {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -5355,6 +5373,52 @@ credentials:
             reparsed.credentials[3].path_template,
             "/v1/{credential}/resources"
         );
+    }
+
+    #[test]
+    fn openshell_token_grant_profile_round_trips_and_rejects_unsafe_endpoints() {
+        let yaml = r"
+id: signed-provider
+display_name: Signed Provider
+credentials:
+  - name: access
+    auth_style: bearer
+    token_grant:
+      grant_type: openshell_client_credentials
+      token_endpoint: https://issuer.example/token
+";
+        let profile = parse_profile_yaml(yaml).unwrap();
+        let grant = profile.credentials[0].token_grant.as_ref().unwrap();
+        assert_eq!(token_grant_from_proto(&token_grant_to_proto(grant)), *grant);
+        let diagnostics = |profile: ProviderTypeProfile| {
+            validate_profile_set(&[("test.yaml".to_string(), profile)])
+                .into_iter()
+                .filter(|d| d.field == "credentials.token_grant")
+                .count()
+        };
+        assert_eq!(diagnostics(profile.clone()), 0);
+        for endpoint in [
+            "http://localhost/token",
+            "https://u:p@issuer.example/token",
+            "https://issuer.example/token?x=1",
+            "https://issuer.example/token#x",
+            "https://issuer.example/other/../token",
+        ] {
+            let mut bad = profile.clone();
+            bad.credentials[0]
+                .token_grant
+                .as_mut()
+                .unwrap()
+                .token_endpoint = endpoint.into();
+            assert_eq!(diagnostics(bad), 1);
+        }
+        let mut bad = profile;
+        bad.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .jwt_svid_audience = "elsewhere".into();
+        assert_eq!(diagnostics(bad), 1);
     }
 
     #[test]

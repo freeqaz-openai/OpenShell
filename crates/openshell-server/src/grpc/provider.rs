@@ -3773,6 +3773,21 @@ fn profiles_from_import_items(
                 });
             }
         }
+        // Profile conversion defaults unknown grant types to client credentials.
+        if let Some(index) = profile.credentials.iter().position(|credential| {
+            credential.token_grant.as_ref().is_some_and(|grant| {
+                ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
+            })
+        }) {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source,
+                profile_id: profile.id.clone(),
+                field: format!("credentials[{index}].token_grant.grant_type"),
+                message: "unknown provider token grant type".to_string(),
+                severity: "error".to_string(),
+            });
+            continue;
+        }
         profiles.push((source, ProviderTypeProfile::from_proto(profile)));
     }
     (profiles, diagnostics)
@@ -4394,6 +4409,111 @@ fn token_grant_dependency_status(status: Status) -> Status {
     TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc).to_status_with_code(status.code())
 }
 
+async fn attached_provider_profile(
+    state: &ServerState,
+    sandbox_id: &str,
+    provider_name: &str,
+) -> Result<(Provider, ProviderProfile), Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
+    let workspace = sandbox.object_workspace().to_string();
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::Internal))?;
+    if !spec
+        .providers
+        .iter()
+        .any(|provider| provider == provider_name)
+    {
+        return Err(token_grant_configuration_status(
+            tonic::Code::PermissionDenied,
+        ));
+    }
+
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, provider_name)
+        .await
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await
+        .map_err(token_grant_dependency_status)?;
+    let profile = get_provider_type_profile_for_scope(
+        &catalog,
+        &provider.r#type,
+        &provider.profile_workspace,
+    )
+    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    Ok((provider, profile.to_proto()))
+}
+
+pub(super) async fn handle_mint_provider_client_assertion(
+    state: &ServerState,
+    request: Request<openshell_core::proto::MintProviderClientAssertionRequest>,
+) -> Result<Response<openshell_core::proto::MintProviderClientAssertionResponse>, Status> {
+    use crate::auth::principal::SandboxIdentitySource;
+    let req = request.get_ref();
+    let denied = || token_grant_configuration_status(tonic::Code::PermissionDenied);
+    let Some(Principal::Sandbox(principal)) = request.extensions().get::<Principal>() else {
+        return Err(denied());
+    };
+    if principal.sandbox_id != req.sandbox_id
+        || !matches!(
+            principal.source,
+            SandboxIdentitySource::BootstrapJwt {
+                auth_epoch: Some(_),
+                ..
+            }
+        )
+    {
+        return Err(denied());
+    }
+    let (provider, profile) =
+        attached_provider_profile(state, &req.sandbox_id, &req.provider).await?;
+    let grant = profile
+        .credentials
+        .iter()
+        .find(|credential| credential.name == req.credential_key)
+        .and_then(|credential| credential.token_grant.as_ref())
+        .ok_or_else(denied)?;
+    if grant.grant_type != ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+        || grant.token_endpoint != req.token_endpoint
+        || !grant.jwt_svid_audience.is_empty()
+        || !grant.client_assertion_type.is_empty()
+        || grant.subject_token.is_some()
+        || !state.provider_assertions.iter().any(|registration| {
+            registration.provider_id == provider.object_id()
+                && registration.credential_key == req.credential_key
+                && registration.token_endpoint == grant.token_endpoint
+        })
+    {
+        return Err(denied());
+    }
+    let issuer = state
+        .extension_jwt_issuer
+        .as_ref()
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    let client_assertion = issuer
+        .mint_provider_client_assertion(
+            &principal.sandbox_id,
+            provider.object_id(),
+            &req.credential_key,
+            &grant.token_endpoint,
+        )
+        .map_err(sanitize_token_grant_status)?;
+    Ok(Response::new(
+        openshell_core::proto::MintProviderClientAssertionResponse { client_assertion },
+    ))
+}
+
 async fn exchange_provider_subject_token_inner(
     state: &Arc<ServerState>,
     request: Request<ExchangeProviderSubjectTokenRequest>,
@@ -4431,45 +4551,8 @@ async fn exchange_provider_subject_token_inner(
         ));
     }
 
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&req.sandbox_id)
-        .await
-        .map_err(|_| token_grant_store_status())?
-        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
-    let workspace = sandbox.object_workspace().to_string();
-    let spec = sandbox
-        .spec
-        .as_ref()
-        .ok_or_else(|| token_grant_configuration_status(tonic::Code::Internal))?;
-    if !spec
-        .providers
-        .iter()
-        .any(|provider| provider == &req.provider)
-    {
-        return Err(token_grant_configuration_status(
-            tonic::Code::PermissionDenied,
-        ));
-    }
-
-    let provider = state
-        .store
-        .get_message_by_name::<Provider>(&workspace, &req.provider)
-        .await
-        .map_err(|_| token_grant_store_status())?
-        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
-    let catalog = state
-        .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await
-        .map_err(token_grant_dependency_status)?;
-    let profile = get_provider_type_profile_for_scope(
-        &catalog,
-        &provider.r#type,
-        &provider.profile_workspace,
-    )
-    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
-    let profile_proto = profile.to_proto();
+    let (provider, profile_proto) =
+        attached_provider_profile(state, &req.sandbox_id, &req.provider).await?;
     let credential = profile_proto
         .credentials
         .iter()
@@ -5719,6 +5802,153 @@ mod tests {
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
+        }
+
+        #[tokio::test]
+        async fn token_grant_assertion_requires_supervisor_attachment_and_exact_registration() {
+            use crate::auth::sandbox_jwt::ExtensionJwtIssuer;
+            use crate::config_file::ProviderAssertionRegistration;
+            use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+            use openshell_core::jwt::CredentialEpoch;
+            use openshell_core::proto::MintProviderClientAssertionRequest;
+
+            let endpoint = "https://issuer.example/token";
+            let mut state = test_server_state_without_provider_profiles().await;
+            let state = Arc::get_mut(&mut state).unwrap();
+            let key = openshell_bootstrap::jwt::generate_jwt_key().unwrap();
+            state.extension_jwt_issuer = Some(Arc::new(
+                ExtensionJwtIssuer::from_pem(
+                    key.signing_key_pem.as_bytes(),
+                    key.public_key_pem.as_bytes(),
+                    key.kid.clone(),
+                    "demo",
+                    std::time::Duration::from_secs(300),
+                )
+                .unwrap(),
+            ));
+            let mut profile = custom_profile("signed-grant");
+            profile.credentials = vec![ProviderProfileCredential {
+                name: "access".into(),
+                token_grant: Some(ProviderCredentialTokenGrant {
+                    grant_type: ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32,
+                    token_endpoint: endpoint.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }];
+            state
+                .store
+                .put_message(&crate::provider_profile_sources::stored_provider_profile(
+                    profile,
+                ))
+                .await
+                .unwrap();
+            let mut provider = provider_with_values("attached", "signed-grant");
+            provider.metadata.as_mut().unwrap().id = "provider-id".into();
+            provider.profile_workspace.clear();
+            state.store.put_message(&provider).await.unwrap();
+            state
+                .store
+                .put_message(&sandbox_in_default_workspace(
+                    "sandbox-id",
+                    vec!["attached".into()],
+                ))
+                .await
+                .unwrap();
+            let request = |caller: &str, provider: &str, credential: &str, url: &str| {
+                let mut req = Request::new(MintProviderClientAssertionRequest {
+                    sandbox_id: "sandbox-id".into(),
+                    provider: provider.into(),
+                    credential_key: credential.into(),
+                    token_endpoint: url.into(),
+                });
+                req.extensions_mut()
+                    .insert(Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: caller.into(),
+                        trust_domain: None,
+                        source: SandboxIdentitySource::BootstrapJwt {
+                            issuer: "openshell-gateway:demo".into(),
+                            auth_epoch: Some(CredentialEpoch::new(1).unwrap()),
+                        },
+                    }));
+                req
+            };
+            let good = || request("sandbox-id", "attached", "access", endpoint);
+            assert!(
+                handle_mint_provider_client_assertion(state, good())
+                    .await
+                    .is_err()
+            );
+            state
+                .provider_assertions
+                .push(ProviderAssertionRegistration {
+                    provider_id: "provider-id".into(),
+                    credential_key: "access".into(),
+                    token_endpoint: endpoint.into(),
+                });
+            let assertion = handle_mint_provider_client_assertion(state, good())
+                .await
+                .unwrap()
+                .into_inner()
+                .client_assertion;
+            let public = DecodingKey::from_ed_pem(key.public_key_pem.as_bytes()).unwrap();
+            let mut validation = Validation::new(Algorithm::EdDSA);
+            validation.set_audience(&[endpoint]);
+            validation.set_issuer(&["openshell-gateway:demo"]);
+            let verified = openshell_crypto::jwt::decode::<serde_json::Value>(
+                &assertion,
+                &public,
+                &validation,
+            )
+            .unwrap();
+            assert_eq!(
+                verified.header.typ.as_deref(),
+                Some("openshell-provider-assertion+jwt")
+            );
+            assert_eq!(verified.header.kid.as_deref(), Some(key.kid.as_str()));
+            let claims = verified.claims;
+            assert_eq!(claims["sub"], "openshell-sandbox:sandbox-id");
+            assert_eq!(claims["sandbox_id"], "sandbox-id");
+            assert_eq!(claims["provider_id"], "provider-id");
+            assert_eq!(claims["credential_key"], "access");
+            assert_eq!(claims["caller_kind"], "supervisor");
+            assert_eq!(
+                claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+                60
+            );
+            assert!(uuid::Uuid::parse_str(claims["jti"].as_str().unwrap()).is_ok());
+            validation.set_audience(&["openshell-gateway:demo"]);
+            assert!(
+                openshell_crypto::jwt::decode::<serde_json::Value>(
+                    &assertion,
+                    &public,
+                    &validation
+                )
+                .is_err()
+            );
+            for invalid in [
+                request("sibling", "attached", "access", endpoint),
+                request("sandbox-id", "detached", "access", endpoint),
+                request("sandbox-id", "attached", "wrong", endpoint),
+                request(
+                    "sandbox-id",
+                    "attached",
+                    "access",
+                    "https://issuer.example/other",
+                ),
+            ] {
+                assert!(
+                    handle_mint_provider_client_assertion(state, invalid)
+                        .await
+                        .is_err()
+                );
+            }
+            state.provider_assertions[0].provider_id = "different-instance".into();
+            assert!(
+                handle_mint_provider_client_assertion(state, good())
+                    .await
+                    .is_err()
+            );
         }
 
         fn assert_generic(status: &Status, code: Code) -> TokenGrantFailure {
@@ -7708,6 +7938,146 @@ mod tests {
             diagnostic.field == "credentials.refresh.refresh_before"
                 && diagnostic.message.contains("valid non-negative duration")
         }));
+    }
+
+    fn provider_profile_import_item_with_grant(
+        id: &str,
+        grant_type: i32,
+    ) -> ProviderProfileImportItem {
+        let mut profile = custom_profile(id);
+        profile.credentials.push(ProviderProfileCredential {
+            name: "access_token".into(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                grant_type,
+                token_endpoint: "https://issuer.example/token".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        if grant_type == ProviderCredentialTokenGrantType::TokenExchange as i32 {
+            profile.credentials[0]
+                .token_grant
+                .as_mut()
+                .unwrap()
+                .subject_token = Some(ProviderCredentialTokenGrantSubjectToken {
+                source: "provider_credential".into(),
+                credential: "subject_token".into(),
+                ..Default::default()
+            });
+            profile.credentials.push(ProviderProfileCredential {
+                name: "subject_token".into(),
+                ..Default::default()
+            });
+        }
+        profile.endpoints.push(NetworkEndpoint {
+            host: "api.example.com".into(),
+            port: 443,
+            protocol: "rest".into(),
+            access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        });
+        ProviderProfileImportItem {
+            profile: Some(profile),
+            source: format!("{id}.proto"),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_provider_profiles_rejects_unknown_grant_types_without_writing() {
+        use openshell_core::proto::open_shell_server::OpenShell;
+
+        let service = crate::grpc::OpenShellService::new(test_server_state().await);
+        let response = service
+            .import_provider_profiles(authed_request(ImportProviderProfilesRequest {
+                profiles: vec![
+                    provider_profile_import_item_with_grant("grant-legacy", 0),
+                    provider_profile_import_item_with_grant("grant-negative", -1),
+                    provider_profile_import_item_with_grant("grant-unknown", i32::MAX),
+                ],
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!response.imported, "{response:?}");
+        assert!(response.profiles.is_empty());
+        assert_eq!(response.diagnostics.len(), 2);
+        for id in ["grant-negative", "grant-unknown"] {
+            assert!(response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.profile_id == id
+                    && diagnostic.source == format!("{id}.proto")
+                    && diagnostic.field == "credentials[0].token_grant.grant_type"
+                    && diagnostic.severity == "error"
+            }));
+        }
+        for id in ["grant-legacy", "grant-negative", "grant-unknown"] {
+            let error = service
+                .get_provider_profile(authed_request(GetProviderProfileRequest {
+                    id: id.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn import_provider_profiles_preserves_known_grant_types_and_legacy_default() {
+        use openshell_core::proto::ProviderCredentialTokenGrantType::{
+            ClientCredentials, OpenshellClientCredentials, TokenExchange, Unspecified,
+        };
+        use openshell_core::proto::open_shell_server::OpenShell;
+
+        let service = crate::grpc::OpenShellService::new(test_server_state().await);
+        let cases = [
+            ("grant-legacy", Unspecified, ClientCredentials),
+            ("grant-client", ClientCredentials, ClientCredentials),
+            ("grant-exchange", TokenExchange, TokenExchange),
+            (
+                "grant-openshell",
+                OpenshellClientCredentials,
+                OpenshellClientCredentials,
+            ),
+        ];
+        let response = service
+            .import_provider_profiles(authed_request(ImportProviderProfilesRequest {
+                profiles: cases
+                    .iter()
+                    .map(|(id, input, _)| {
+                        provider_profile_import_item_with_grant(id, *input as i32)
+                    })
+                    .collect(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(response.imported, "{response:?}");
+        assert_eq!(response.profiles.len(), cases.len());
+        for (id, _, expected) in cases {
+            let profile = service
+                .get_provider_profile(authed_request(GetProviderProfileRequest {
+                    id: id.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .profile
+                .unwrap();
+            assert_eq!(
+                profile.credentials[0]
+                    .token_grant
+                    .as_ref()
+                    .unwrap()
+                    .grant_type,
+                expected as i32,
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]
