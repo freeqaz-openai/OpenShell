@@ -1857,10 +1857,8 @@ mod token_grant_exchange_tests {
             (Some("line\nbreak"), None),
             (None, None),
         ] {
-            let request = token_grant_gateway_request(
-                ExchangeProviderSubjectTokenRequest::default(),
-                value,
-            );
+            let request =
+                token_grant_gateway_request(ExchangeProviderSubjectTokenRequest::default(), value);
             let carried = request.metadata().get("x-request-id");
             assert_eq!(carried.and_then(|value| value.to_str().ok()), expected);
         }
