@@ -1759,11 +1759,7 @@ pub async fn provider_profile_import(
 
     let mut client = grpc_client(server, tls).await?;
     if !items.is_empty() {
-        if profiles_require_stable_placeholders(&items)
-            || profiles_require_gateway_assertion(&items)
-        {
-            lint_profile_items(&mut client, items.clone(), workspace).await?;
-        }
+        check_profile_write_capabilities(&mut client, &items, workspace).await?;
         let response = client
             .import_provider_profiles(assertion_profile_request(ImportProviderProfilesRequest {
                 request_id: String::new(),
@@ -1810,11 +1806,8 @@ pub async fn provider_profile_update(
 
     let mut client = grpc_client(server, tls).await?;
     if let Some(item) = items.pop() {
-        if profiles_require_stable_placeholders(std::slice::from_ref(&item))
-            || profiles_require_gateway_assertion(std::slice::from_ref(&item))
-        {
-            lint_profile_items(&mut client, vec![item.clone()], workspace).await?;
-        }
+        check_profile_write_capabilities(&mut client, std::slice::from_ref(&item), workspace)
+            .await?;
         let expected_resource_version = item
             .profile
             .as_ref()
@@ -2193,8 +2186,18 @@ fn assertion_profile_request<T>(body: T) -> tonic::Request<T> {
     request
 }
 
-// Check support before persisting an opt-in: older gateways discard unknown
-// credential fields and can otherwise report a successful revision-scoped import.
+// Older gateways can accept a profile write without preserving the opt-in.
+async fn check_profile_write_capabilities(
+    client: &mut crate::tls::GrpcClient,
+    items: &[ProviderProfileImportItem],
+    workspace: &str,
+) -> Result<()> {
+    if profiles_require_stable_placeholders(items) || profiles_require_gateway_assertion(items) {
+        lint_profile_items(client, items.to_vec(), workspace).await?;
+    }
+    Ok(())
+}
+
 async fn lint_profile_items(
     client: &mut crate::tls::GrpcClient,
     items: Vec<ProviderProfileImportItem>,

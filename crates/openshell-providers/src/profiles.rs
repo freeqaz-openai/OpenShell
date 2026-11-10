@@ -193,13 +193,12 @@ pub fn unknown_token_grant_type_diagnostic(
             ProviderCredentialTokenGrantType::try_from(grant.grant_type).is_err()
         })
     })?;
-    Some(ProfileValidationDiagnostic {
-        source: source.to_string(),
-        profile_id: profile.id.clone(),
-        field: format!("credentials[{index}].token_grant.grant_type"),
-        message: "unknown provider token grant type".to_string(),
-        severity: "error".to_string(),
-    })
+    Some(ProfileValidationDiagnostic::error(
+        source,
+        &profile.id,
+        format!("credentials[{index}].token_grant.grant_type"),
+        "unknown provider token grant type",
+    ))
 }
 
 /// Whether a wire profile requires a reader that preserves the identity source.
@@ -213,6 +212,7 @@ pub fn profile_uses_gateway_assertion(profile: &ProviderProfile) -> bool {
 }
 
 impl TokenGrantAssertionSource {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_spiffe(&self) -> bool {
         *self == Self::Spiffe
     }
@@ -1090,8 +1090,7 @@ impl ProviderTypeProfile {
         for credential in &self.credentials {
             if credential.token_grant.as_ref().is_some_and(|grant| {
                 grant.assertion_source == TokenGrantAssertionSource::OpenshellGateway
-                    && effective_token_grant_type(grant.grant_type)
-                        != ProviderCredentialTokenGrantType::ClientCredentials
+                    && !is_client_credentials_grant(grant.grant_type)
             }) {
                 diagnostics.push(ProfileValidationDiagnostic::error(
                     source,
@@ -1364,6 +1363,10 @@ fn effective_token_grant_type(
     }
 }
 
+fn is_client_credentials_grant(grant_type: ProviderCredentialTokenGrantType) -> bool {
+    effective_token_grant_type(grant_type) == ProviderCredentialTokenGrantType::ClientCredentials
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -1502,9 +1505,9 @@ pub fn provider_token_grant_type_to_yaml(
     grant_type: ProviderCredentialTokenGrantType,
 ) -> &'static str {
     match grant_type {
-        ProviderCredentialTokenGrantType::OpenshellClientCredentials => "client_credentials",
         ProviderCredentialTokenGrantType::TokenExchange => "token_exchange",
         ProviderCredentialTokenGrantType::ClientCredentials
+        | ProviderCredentialTokenGrantType::OpenshellClientCredentials
         | ProviderCredentialTokenGrantType::Unspecified => "client_credentials",
     }
 }
@@ -1590,21 +1593,20 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
 fn token_grant_from_proto(
     token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
 ) -> TokenGrantProfile {
-    let wire_grant_type = ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
-        .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
-    let gateway_assertion =
-        wire_grant_type == ProviderCredentialTokenGrantType::OpenshellClientCredentials;
+    let (grant_type, assertion_source) =
+        match ProviderCredentialTokenGrantType::try_from(token_grant.grant_type) {
+            Ok(ProviderCredentialTokenGrantType::OpenshellClientCredentials) => (
+                ProviderCredentialTokenGrantType::ClientCredentials,
+                TokenGrantAssertionSource::OpenshellGateway,
+            ),
+            grant_type => (
+                effective_token_grant_type(grant_type.unwrap_or_default()),
+                TokenGrantAssertionSource::Spiffe,
+            ),
+        };
     TokenGrantProfile {
-        grant_type: if gateway_assertion {
-            ProviderCredentialTokenGrantType::ClientCredentials
-        } else {
-            effective_token_grant_type(wire_grant_type)
-        },
-        assertion_source: if gateway_assertion {
-            TokenGrantAssertionSource::OpenshellGateway
-        } else {
-            TokenGrantAssertionSource::Spiffe
-        },
+        grant_type,
+        assertion_source,
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
@@ -1629,18 +1631,16 @@ fn token_grant_to_proto(
     token_grant: &TokenGrantProfile,
 ) -> openshell_core::proto::ProviderCredentialTokenGrant {
     openshell_core::proto::ProviderCredentialTokenGrant {
-        grant_type: match (
-            token_grant.assertion_source,
-            effective_token_grant_type(token_grant.grant_type),
-        ) {
-            (
-                TokenGrantAssertionSource::OpenshellGateway,
-                ProviderCredentialTokenGrantType::ClientCredentials,
-            ) => ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32,
+        grant_type: match token_grant.assertion_source {
+            TokenGrantAssertionSource::Spiffe => token_grant.grant_type as i32,
+            TokenGrantAssertionSource::OpenshellGateway
+                if is_client_credentials_grant(token_grant.grant_type) =>
+            {
+                ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+            }
             // Infallible lowering must not normalize an invalid combination
             // into a supported grant. Supported receivers reject unknown values.
-            (TokenGrantAssertionSource::OpenshellGateway, _) => -1,
-            (TokenGrantAssertionSource::Spiffe, _) => token_grant.grant_type as i32,
+            TokenGrantAssertionSource::OpenshellGateway => -1,
         },
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
@@ -3401,7 +3401,7 @@ fn validate_token_grant_subject_token(
     let mut diagnostics = Vec::new();
 
     if token_grant.assertion_source == TokenGrantAssertionSource::OpenshellGateway
-        && (grant_type != ProviderCredentialTokenGrantType::ClientCredentials
+        && (!is_client_credentials_grant(token_grant.grant_type)
             || !openshell_core::provider_credentials::provider_assertion_endpoint(
                 &token_grant.token_endpoint,
             )
@@ -6146,44 +6146,31 @@ endpoints:
         let lint = |profile: &ProviderTypeProfile| {
             validate_profile_set(&[("git.yaml".to_string(), profile.clone())])
         };
+        let expect_invalid = |profile: &ProviderTypeProfile, field: &str| {
+            let diagnostics = lint(profile);
+            assert!(
+                diagnostics.iter().any(|error| error.field == field),
+                "expected a diagnostic for {field}: {diagnostics:?}"
+            );
+        };
         assert!(lint(&profile).is_empty(), "default Authorization is valid");
         profile.credentials[0].header_name = "aUtHoRiZaTiOn".into();
         assert!(lint(&profile).is_empty(), "explicit Authorization is valid");
 
         let mut invalid = profile.clone();
         invalid.credentials[0].header_name = "Proxy-Authorization".into();
-        assert!(
-            lint(&invalid)
-                .iter()
-                .any(|error| error.field == "credentials.header_name")
-        );
+        expect_invalid(&invalid, "credentials.header_name");
         let mut invalid = profile.clone();
         invalid.credentials[0].query_param = "token".into();
-        assert!(
-            lint(&invalid)
-                .iter()
-                .any(|error| error.field == "credentials.token_grant.auth_style")
-        );
+        expect_invalid(&invalid, "credentials.token_grant.auth_style");
         let mut invalid = profile.clone();
         invalid.endpoints[0].allow_uninspected_credentials = true;
-        assert!(
-            lint(&invalid)
-                .iter()
-                .any(|error| error.field == "endpoints[0]")
-        );
+        expect_invalid(&invalid, "endpoints[0]");
         let mut invalid = profile.clone();
         invalid.endpoints[0].protocol.clear();
-        assert!(
-            lint(&invalid)
-                .iter()
-                .any(|error| error.field == "endpoints[0]")
-        );
+        expect_invalid(&invalid, "endpoints[0]");
         profile.endpoints[0].tls = "skip".into();
-        assert!(
-            lint(&profile)
-                .iter()
-                .any(|error| error.field == "endpoints[0]")
-        );
+        expect_invalid(&profile, "endpoints[0]");
     }
 
     #[test]
