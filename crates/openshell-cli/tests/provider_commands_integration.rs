@@ -80,6 +80,7 @@ struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
     supports_stable_placeholder: Arc<AtomicBool>,
+    supports_gateway_assertion: Arc<AtomicBool>,
     scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
@@ -1089,6 +1090,10 @@ impl OpenShell for TestOpenShell {
                 supports_stable_placeholder: self
                     .state
                     .supports_stable_placeholder
+                    .load(Ordering::SeqCst),
+                supports_openshell_gateway_assertion_source: self
+                    .state
+                    .supports_gateway_assertion
                     .load(Ordering::SeqCst),
             },
         ))
@@ -4485,6 +4490,57 @@ endpoints:
         .await
         .expect("supporting gateway import");
     assert!(ts.state.profiles.lock().await["second"].credentials[0].stable_placeholder);
+}
+
+#[tokio::test]
+async fn provider_profile_gateway_assertion_negotiates_support_and_round_trips() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().expect("profile directory");
+    let path = dir.path().join("gateway.yaml");
+    std::fs::write(
+        &path,
+        "id: gateway-assertion\ndisplay_name: Gateway Assertion\ncredentials:\n  - name: access\n    token_grant:\n      grant_type: client_credentials\n      assertion_source: openshell_gateway\n      token_endpoint: https://issuer.example/token\n",
+    )
+    .unwrap();
+    let error =
+        run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+            .await
+            .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support assertion_source openshell_gateway")
+    );
+    assert!(ts.state.profiles.lock().await.is_empty());
+
+    ts.state
+        .supports_gateway_assertion
+        .store(true, Ordering::SeqCst);
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+        .await
+        .unwrap();
+    let exported = run::provider_profile_export_text(
+        &ts.endpoint,
+        "gateway-assertion",
+        "yaml",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .unwrap();
+    assert!(exported.contains("grant_type: client_credentials"));
+    assert!(exported.contains("assertion_source: openshell_gateway"));
+    let profile = openshell_providers::parse_profile_yaml(&exported)
+        .unwrap()
+        .to_proto();
+    assert_eq!(
+        profile.credentials[0]
+            .token_grant
+            .as_ref()
+            .unwrap()
+            .grant_type,
+        3
+    );
 }
 
 #[tokio::test]

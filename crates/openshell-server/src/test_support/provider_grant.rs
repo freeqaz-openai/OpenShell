@@ -13,26 +13,26 @@ use openshell_core::proto::{
     open_shell_server::OpenShell, workspace_selector,
 };
 use prost::Message;
-use tokio::net::TcpListener;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::auth::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};
 use crate::auth::sandbox_session::PersistedSandboxIdentity;
 use crate::config_file::ProviderAssertionRegistration;
 use crate::persistence::{ObjectType, WriteCondition};
-use crate::{ConnectionSource, MultiplexService, OpenShellService, Store};
+use crate::{MultiplexService, OpenShellService, Store, TlsAcceptor};
 
 pub const SANDBOX: &str = "wire-sandbox";
-pub const SIBLING: &str = "wire-sibling";
-pub const PROVIDER: &str = "wire-provider";
 pub const PROVIDER_ID: &str = "wire-provider-id";
-pub const UNREGISTERED_PROVIDER: &str = "wire-unregistered";
+const SIBLING: &str = "wire-sibling";
+const PROVIDER: &str = "wire-provider";
 const GATEWAY: &str = "wire-gateway";
 
 pub struct ProviderGrantGateway {
     pub sandbox: GatewayEndpoint,
     pub sibling: GatewayEndpoint,
     accept_loop: JoinHandle<()>,
+    _shutdown: watch::Sender<bool>,
 }
 
 impl Drop for ProviderGrantGateway {
@@ -43,7 +43,7 @@ impl Drop for ProviderGrantGateway {
 
 impl ProviderGrantGateway {
     pub async fn start(
-        tls: tokio_rustls::TlsAcceptor,
+        tls: TlsAcceptor,
         profile: ProviderProfile,
         credential_key: &str,
         endpoint: &str,
@@ -79,7 +79,7 @@ impl ProviderGrantGateway {
 
         let state = Arc::new(state);
         let profile_id = profile.id.clone();
-        let request = super::authenticate_as_dev_user(tonic::Request::new(()))
+        let mut request = super::authenticate_as_dev_user(tonic::Request::new(()))
             .expect("fixture user")
             .map(|()| ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
@@ -89,6 +89,10 @@ impl ProviderGrantGateway {
                 workspace_scope: Some(workspace_selector("default")),
                 ..Default::default()
             });
+        request.metadata_mut().insert(
+            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+            "1".parse().unwrap(),
+        );
         let imported = OpenShellService::new(state.clone())
             .import_provider_profiles(request)
             .await
@@ -100,65 +104,44 @@ impl ProviderGrantGateway {
             imported.diagnostics
         );
 
-        for (name, id) in [
-            (PROVIDER, PROVIDER_ID),
-            (UNREGISTERED_PROVIDER, "wire-unregistered-id"),
-        ] {
-            persist(
-                &state.store,
-                name,
-                id,
-                Provider {
-                    metadata: Some(metadata(name, id)),
-                    r#type: profile_id.clone(),
-                    profile_workspace: "default".into(),
-                    credentials: environment
-                        .iter()
-                        .map(|(name, value)| ((*name).into(), (*value).into()))
-                        .collect(),
-                    ..Default::default()
-                },
-            )
-            .await;
-        }
+        persist(
+            &state.store,
+            PROVIDER,
+            PROVIDER_ID,
+            Provider {
+                metadata: Some(metadata(PROVIDER, PROVIDER_ID)),
+                r#type: profile_id,
+                profile_workspace: "default".into(),
+                credentials: environment
+                    .iter()
+                    .map(|(name, value)| ((*name).into(), (*value).into()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .await;
         let sandbox_credentials =
             persist_sandbox(&state.store, &authority, SANDBOX, PROVIDER).await;
         let sibling_credentials =
-            persist_sandbox(&state.store, &authority, SIBLING, UNREGISTERED_PROVIDER).await;
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+            persist_sandbox(&state.store, &authority, SIBLING, PROVIDER).await;
+        let listener = crate::bind_gateway_listener(([127, 0, 0, 1], 0).into())
             .await
             .expect("gateway bind");
-        let url = format!(
-            "https://localhost:{}",
-            listener.local_addr().unwrap().port()
-        );
-        let service = MultiplexService::new(state);
-        let accept_loop = tokio::spawn(async move {
-            let mut connections = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (stream, peer) = accepted.expect("gateway accept");
-                        openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-                        let service = service.clone();
-                        let tls = tls.clone();
-                        connections.spawn(async move {
-                            let stream = tls.accept(stream).await.expect("gateway TLS");
-                            service.serve(stream, ConnectionSource::Peer(peer)).await
-                        });
-                    }
-                    completed = connections.join_next(), if !connections.is_empty() => {
-                        // HTTP/2 clients can drop a connection without a graceful close.
-                        let _ = completed.expect("gateway connection").expect("gateway task");
-                    }
-                }
-            }
-        });
+        let url = format!("https://localhost:{}", listener.address.port());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let accept_loop = tokio::spawn(crate::serve_gateway_listener(
+            listener,
+            MultiplexService::new(state),
+            Some(tls),
+            false,
+            shutdown_rx,
+        ));
 
         Self {
             sandbox: GatewayEndpoint::new(url.clone(), sandbox_credentials),
             sibling: GatewayEndpoint::new(url, sibling_credentials),
             accept_loop,
+            _shutdown: shutdown,
         }
     }
 }

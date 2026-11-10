@@ -1787,6 +1787,8 @@ fn insert_dynamic_credentials_for_profile(
         if credential.token_grant.is_none() {
             continue;
         }
+        let mut credential = credential.clone();
+        credential.token_grant_provider_id = provider_id.to_string();
         for (endpoint, owner) in profile.endpoints.iter().zip(&owners) {
             let ports = if endpoint.ports.is_empty() {
                 std::slice::from_ref(&endpoint.port)
@@ -1800,7 +1802,7 @@ fn insert_dynamic_credentials_for_profile(
                     port,
                     &endpoint.path,
                     provider_name,
-                    credential,
+                    &credential,
                     owner,
                 )?;
             }
@@ -2989,6 +2991,7 @@ pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
 ) -> Result<Response<ListProviderProfilesResponse>, Status> {
+    let supports_gateway_assertion = supports_gateway_assertion_profiles(&request);
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     let workspace = authorize_and_resolve_profile_workspace(
@@ -3030,6 +3033,13 @@ pub(super) async fn handle_list_provider_profiles(
         .map_err(|_| Status::internal("page_size does not fit usize"))?;
     let has_more = profiles.len() > page_size;
     profiles.truncate(page_size);
+    if !supports_gateway_assertion
+        && profiles
+            .iter()
+            .any(|(_, profile)| openshell_providers::profile_uses_gateway_assertion(profile))
+    {
+        return Err(gateway_assertion_profile_capability_required());
+    }
     let next_key = if has_more {
         profiles.last().map(|(key, _)| key.as_str())
     } else {
@@ -3046,6 +3056,7 @@ pub(super) async fn handle_get_provider_profile(
     state: &Arc<ServerState>,
     request: Request<GetProviderProfileRequest>,
 ) -> Result<Response<ProviderProfileResponse>, Status> {
+    let supports_gateway_assertion = supports_gateway_assertion_profiles(&request);
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
     let workspace = authorize_and_resolve_profile_workspace(
@@ -3065,6 +3076,7 @@ pub(super) async fn handle_get_provider_profile(
     let profile = catalog
         .get_profile(&id)
         .ok_or_else(|| Status::not_found("provider profile not found"))?;
+    require_gateway_assertion_profile_capability(supports_gateway_assertion, &profile)?;
 
     Ok(Response::new(ProviderProfileResponse {
         profile: Some(profile),
@@ -3075,9 +3087,17 @@ pub(super) async fn handle_import_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+    let supports_gateway_assertion = supports_gateway_assertion_profiles(&request);
     let principal = super::extract_principal(&request)?;
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
+    for profile in request
+        .profiles
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+    {
+        require_gateway_assertion_profile_capability(supports_gateway_assertion, profile)?;
+    }
     let workspace = authorize_and_resolve_profile_workspace(
         state,
         &principal,
@@ -3170,9 +3190,17 @@ pub(super) async fn handle_update_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderProfilesRequest>,
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+    let supports_gateway_assertion = supports_gateway_assertion_profiles(&request);
     let principal = super::extract_principal(&request)?;
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let request = request.into_inner();
+    if let Some(profile) = request
+        .profile
+        .as_ref()
+        .and_then(|item| item.profile.as_ref())
+    {
+        require_gateway_assertion_profile_capability(supports_gateway_assertion, profile)?;
+    }
     let workspace = authorize_and_resolve_profile_workspace(
         state,
         &principal,
@@ -3255,6 +3283,25 @@ pub(super) async fn handle_update_provider_profiles(
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider profile not found"))?;
+    if let Some(current) = stored.profile.as_ref() {
+        require_gateway_assertion_profile_capability(supports_gateway_assertion, current)?;
+        for credential in &current.credentials {
+            if credential.token_grant.as_ref().is_some_and(|grant| {
+                grant.grant_type
+                    == ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+            }) && profile.credentials.iter().any(|next| {
+                next.name == credential.name
+                    && next.token_grant.as_ref().is_some_and(|grant| {
+                        grant.assertion_source
+                            != openshell_providers::TokenGrantAssertionSource::OpenshellGateway
+                    })
+            }) {
+                return Err(Status::failed_precondition(
+                    "remove the gateway assertion credential before changing its assertion source",
+                ));
+            }
+        }
+    }
     let current_version = stored
         .metadata
         .as_ref()
@@ -3302,6 +3349,29 @@ pub(super) async fn handle_update_provider_profiles(
     }))
 }
 
+fn supports_gateway_assertion_profiles<T>(request: &Request<T>) -> bool {
+    request
+        .metadata()
+        .get(openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY)
+        .is_some_and(|value| value == "1")
+}
+
+fn gateway_assertion_profile_capability_required() -> Status {
+    Status::failed_precondition(
+        "profile client does not support assertion_source openshell_gateway",
+    )
+}
+
+fn require_gateway_assertion_profile_capability(
+    supported: bool,
+    profile: &ProviderProfile,
+) -> Result<(), Status> {
+    if !supported && openshell_providers::profile_uses_gateway_assertion(profile) {
+        return Err(gateway_assertion_profile_capability_required());
+    }
+    Ok(())
+}
+
 pub(super) async fn handle_lint_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<LintProviderProfilesRequest>,
@@ -3332,6 +3402,7 @@ pub(super) async fn handle_lint_provider_profiles(
         diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
         valid,
         supports_stable_placeholder: true,
+        supports_openshell_gateway_assertion_source: true,
     }))
 }
 
@@ -4455,7 +4526,8 @@ pub(super) async fn handle_mint_provider_client_assertion(
     let Some(Principal::Sandbox(principal)) = request.extensions().get::<Principal>() else {
         return Err(denied());
     };
-    if principal.sandbox_id != req.sandbox_id
+    if req.expected_provider_id.is_empty()
+        || principal.sandbox_id != req.sandbox_id
         || !matches!(
             principal.source,
             SandboxIdentitySource::BootstrapJwt {
@@ -4466,6 +4538,16 @@ pub(super) async fn handle_mint_provider_client_assertion(
     {
         return Err(denied());
     }
+    if !state
+        .provider_assertion_mint_limiter
+        .try_acquire(&principal.sandbox_id)
+    {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::Unavailable,
+            TokenGrantStage::GatewayRpc,
+        )
+        .to_status_with_code(tonic::Code::ResourceExhausted));
+    }
     let (provider, profile) =
         attached_provider_profile(state, &req.sandbox_id, &req.provider).await?;
     let grant = profile
@@ -4474,11 +4556,13 @@ pub(super) async fn handle_mint_provider_client_assertion(
         .find(|credential| credential.name == req.credential_key)
         .and_then(|credential| credential.token_grant.as_ref())
         .ok_or_else(denied)?;
-    if grant.grant_type != ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
+    if provider.object_id() != req.expected_provider_id
+        || grant.grant_type != ProviderCredentialTokenGrantType::OpenshellClientCredentials as i32
         || grant.token_endpoint != req.token_endpoint
         || !grant.jwt_svid_audience.is_empty()
         || !grant.client_assertion_type.is_empty()
         || grant.subject_token.is_some()
+        || !grant.requested_token_type.is_empty()
         || !state.provider_assertions.iter().any(|registration| {
             registration.provider_id == provider.object_id()
                 && registration.credential_key == req.credential_key
@@ -4500,7 +4584,10 @@ pub(super) async fn handle_mint_provider_client_assertion(
         )
         .map_err(sanitize_token_grant_status)?;
     Ok(Response::new(
-        openshell_core::proto::MintProviderClientAssertionResponse { client_assertion },
+        openshell_core::proto::MintProviderClientAssertionResponse {
+            client_assertion,
+            bound_provider_id: provider.object_id().to_owned(),
+        },
     ))
 }
 
@@ -5851,6 +5938,7 @@ mod tests {
                     provider: provider.into(),
                     credential_key: credential.into(),
                     token_endpoint: url.into(),
+                    expected_provider_id: "provider-id".into(),
                 });
                 req.extensions_mut()
                     .insert(Principal::Sandbox(SandboxPrincipal {
@@ -5876,11 +5964,12 @@ mod tests {
                     credential_key: "access".into(),
                     token_endpoint: endpoint.into(),
                 });
-            let assertion = handle_mint_provider_client_assertion(state, good())
+            let response = handle_mint_provider_client_assertion(state, good())
                 .await
                 .unwrap()
-                .into_inner()
-                .client_assertion;
+                .into_inner();
+            assert_eq!(response.bound_provider_id, "provider-id");
+            let assertion = response.client_assertion;
             let public = DecodingKey::from_ed_pem(key.public_key_pem.as_bytes()).unwrap();
             let mut validation = Validation::new(Algorithm::EdDSA);
             validation.set_audience(&[endpoint]);
@@ -5939,6 +6028,47 @@ mod tests {
                     .await
                     .is_err()
             );
+            state
+                .store
+                .delete(Provider::object_type(), "provider-id")
+                .await
+                .unwrap();
+            provider.metadata.as_mut().unwrap().id = "different-instance".into();
+            state.store.put_message(&provider).await.unwrap();
+            assert_eq!(
+                handle_mint_provider_client_assertion(state, good())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::PermissionDenied,
+                "a registered replacement must not satisfy the installed provider identity"
+            );
+            let mut replacement = good();
+            replacement.get_mut().expected_provider_id = "different-instance".into();
+            let response = handle_mint_provider_client_assertion(state, replacement)
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.bound_provider_id, "different-instance");
+            state.provider_assertion_mint_limiter =
+                crate::auth::extension_mint_limit::ExtensionMintLimiter::new(
+                    std::time::Duration::from_secs(60),
+                    1,
+                );
+            assert!(
+                state
+                    .provider_assertion_mint_limiter
+                    .try_acquire("sandbox-id")
+            );
+            assert_eq!(
+                handle_mint_provider_client_assertion(state, good())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::ResourceExhausted,
+                "the budget must apply before even looking up the stale provider"
+            );
+            assert!(state.extension_mint_limiter.try_acquire("sandbox-id"));
         }
 
         fn assert_generic(status: &Status, code: Code) -> TokenGrantFailure {
@@ -6339,6 +6469,7 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant_owners: vec!["untrusted-profile-owner".to_string()],
+            token_grant_provider_id: "untrusted-profile-provider".to_string(),
             token_grant: Some(ProviderCredentialTokenGrant {
                 grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
@@ -6406,6 +6537,7 @@ mod tests {
                 .unwrap();
             assert_eq!(credential.token_grant_owners.len(), 1);
             assert_ne!(credential.token_grant_owners[0], "untrusted-profile-owner");
+            assert_eq!(credential.token_grant_provider_id, "provider-uid");
             assert!(key.contains(&credential.token_grant_owners[0]));
             let grant = credential.token_grant.as_ref().unwrap();
             assert_eq!(grant.audience, audience);
@@ -7479,6 +7611,7 @@ mod tests {
     fn refreshable_credential(name: &str, env_var: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
             token_grant_owners: Vec::new(),
+            token_grant_provider_id: String::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: vec![env_var.to_string()],
@@ -7550,6 +7683,7 @@ mod tests {
     fn static_credential(name: &str, env_var: &str, required: bool) -> ProviderProfileCredential {
         ProviderProfileCredential {
             token_grant_owners: Vec::new(),
+            token_grant_provider_id: String::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: vec![env_var.to_string()],
@@ -7567,6 +7701,7 @@ mod tests {
     fn token_grant_credential(name: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
             token_grant_owners: Vec::new(),
+            token_grant_provider_id: String::new(),
             name: name.to_string(),
             description: String::new(),
             env_vars: Vec::new(),
@@ -8031,28 +8166,93 @@ mod tests {
                 OpenshellClientCredentials,
             ),
         ];
+        assert_eq!(
+            service
+                .import_provider_profiles(authed_request(ImportProviderProfilesRequest {
+                    profiles: vec![provider_profile_import_item_with_grant(
+                        "grant-openshell",
+                        OpenshellClientCredentials as i32,
+                    )],
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+        );
+        let mut import = authed_request(ImportProviderProfilesRequest {
+            profiles: cases
+                .iter()
+                .map(|(id, input, _)| provider_profile_import_item_with_grant(id, *input as i32))
+                .collect(),
+            ..Default::default()
+        });
+        import.metadata_mut().insert(
+            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
         let response = service
-            .import_provider_profiles(authed_request(ImportProviderProfilesRequest {
-                profiles: cases
-                    .iter()
-                    .map(|(id, input, _)| {
-                        provider_profile_import_item_with_grant(id, *input as i32)
-                    })
-                    .collect(),
-                ..Default::default()
-            }))
+            .import_provider_profiles(import)
             .await
             .unwrap()
             .into_inner();
 
         assert!(response.imported, "{response:?}");
         assert_eq!(response.profiles.len(), cases.len());
-        for (id, _, expected) in cases {
-            let profile = service
+        assert_eq!(
+            service
                 .get_provider_profile(authed_request(GetProviderProfileRequest {
-                    id: id.into(),
+                    id: "grant-openshell".into(),
                     ..Default::default()
                 }))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+        );
+        let mut stripped = response
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "grant-openshell")
+            .unwrap()
+            .clone();
+        stripped.credentials[0]
+            .token_grant
+            .as_mut()
+            .unwrap()
+            .grant_type = ClientCredentials as i32;
+        let mut stale_update = authed_request(UpdateProviderProfilesRequest {
+            id: stripped.id.clone(),
+            expected_resource_version: stripped.resource_version,
+            profile: Some(ProviderProfileImportItem {
+                profile: Some(stripped),
+                source: "stripped.yaml".into(),
+            }),
+            ..Default::default()
+        });
+        stale_update.metadata_mut().insert(
+            openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+            tonic::metadata::MetadataValue::from_static("1"),
+        );
+        assert_eq!(
+            service
+                .update_provider_profiles(stale_update)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        for (id, _, expected) in cases {
+            let mut request = authed_request(GetProviderProfileRequest {
+                id: id.into(),
+                ..Default::default()
+            });
+            request.metadata_mut().insert(
+                openshell_providers::GATEWAY_ASSERTION_PROFILE_CAPABILITY,
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            let profile = service
+                .get_provider_profile(request)
                 .await
                 .unwrap()
                 .into_inner()
@@ -12076,6 +12276,7 @@ mod tests {
                             description: String::new(),
                             env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
                             token_grant_owners: Vec::new(),
+                            token_grant_provider_id: String::new(),
                             required: true,
                             stable_placeholder: false,
                             auth_style: "bearer".to_string(),

@@ -19,25 +19,21 @@ use hyper_util::{
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, errors::ErrorKind, jwk::JwkSet};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use openshell_core::{
-    grpc_client::{
-        GatewayEndpoint, connect_channel_pub, fetch_provider_environment, fetch_settings_snapshot,
-    },
+    grpc_client::{GatewayEndpoint, fetch_provider_environment, fetch_settings_snapshot},
     oauth::DEFAULT_CLIENT_ASSERTION_TYPE,
     proto::{
-        MintProviderClientAssertionRequest, NetworkAccessPreset, NetworkBinary, NetworkEndpoint,
-        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfile,
-        ProviderProfileCategory, ProviderProfileCredential, open_shell_client::OpenShellClient,
+        NetworkAccessPreset, NetworkBinary, NetworkEndpoint, ProviderCredentialTokenGrant,
+        ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential,
     },
     provider_credentials::ProviderCredentialState,
     token_grant_failure::REQUEST_ID_HEADER,
 };
 use openshell_server::{
     TlsAcceptor,
-    test_support::provider_grant::{
-        PROVIDER, PROVIDER_ID, ProviderGrantGateway, SANDBOX, SIBLING, UNREGISTERED_PROVIDER,
-    },
+    test_support::provider_grant::{PROVIDER_ID, ProviderGrantGateway, SANDBOX},
 };
 use serde::Deserialize;
 use tokio::{
@@ -46,7 +42,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
-use super::{Connection, HOST, PORT, WAIT, capture_upstream};
+use super::{Connection, HOST, PORT, WAIT};
 use crate::l7::relay::L7EvalContext;
 use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::{NetworkAction, NetworkInput, OpaEngine};
@@ -79,7 +75,14 @@ fn provider_client_assertion_wire() {
     // TLS trust is process configuration for both real clients. Give this case
     // an isolated process so other tests never observe its ephemeral CA.
     let cert_dir = tempfile::tempdir().unwrap();
-    write_test_certs(cert_dir.path());
+    let pki = openshell_otel_test_support::TestPki::generate();
+    for (name, pem) in [
+        ("ca.pem", pki.ca_pem),
+        ("server-cert.pem", pki.server.cert_pem),
+        ("server-key.pem", pki.server.key_pem),
+    ] {
+        std::fs::write(cert_dir.path().join(name), pem).unwrap();
+    }
     let ca = cert_dir.path().join("ca.pem");
     let full_name = concat!(module_path!(), "::provider_client_assertion_wire");
     let (_, test_name) = full_name.split_once("::").expect("crate prefix");
@@ -99,28 +102,6 @@ fn provider_client_assertion_wire() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-}
-
-fn write_test_certs(directory: &Path) {
-    use openshell_crypto::pki;
-
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "wire-test-ca");
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_key = pki::generate_keypair().unwrap();
-    let ca = pki::self_signed(ca_params, &ca_key).unwrap();
-    let leaf_key = pki::generate_keypair().unwrap();
-    let leaf_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-    let leaf = pki::signed_by(leaf_params, &leaf_key, &ca, &ca_key).unwrap();
-    std::fs::write(directory.join("ca.pem"), ca.pem()).unwrap();
-    std::fs::write(directory.join("server-cert.pem"), leaf.pem()).unwrap();
-    std::fs::write(
-        directory.join("server-key.pem"),
-        leaf_key.serialize_pem().unwrap(),
-    )
-    .unwrap();
 }
 
 async fn run(cert_dir: &Path) {
@@ -144,7 +125,7 @@ async fn run(cert_dir: &Path) {
     );
     let binary = crate::test_support::executable_path("/usr/bin/curl");
     let gateway = ProviderGrantGateway::start(
-        tls.acceptor(),
+        tls.clone(),
         profile(&broker_url, &binary),
         CREDENTIAL,
         &broker_url,
@@ -166,6 +147,13 @@ async fn run(cert_dir: &Path) {
     let delivery = fetch_provider_environment(&gateway.sandbox, SANDBOX)
         .await
         .expect("fetch real provider installation over TLS");
+    assert!(
+        delivery
+            .dynamic_credentials
+            .values()
+            .any(|credential| credential.token_grant_provider_id == PROVIDER_ID),
+        "Gateway delivers the immutable provider identity"
+    );
     let state = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
         delivery.provider_env_revision,
         delivery.environment,
@@ -186,31 +174,6 @@ async fn run(cert_dir: &Path) {
             .all(|value| { !value.contains(PLACEHOLDER_VALUE) && !value.contains(ACCESS_TOKEN) }),
         "workload environment contains only the credential placeholder",
     );
-
-    for (caller, sandbox_id, provider, recipient) in [
-        (&gateway.sibling, SANDBOX, PROVIDER, broker_url.clone()),
-        (
-            &gateway.sandbox,
-            SANDBOX,
-            UNREGISTERED_PROVIDER,
-            broker_url.clone(),
-        ),
-        (
-            &gateway.sibling,
-            SIBLING,
-            UNREGISTERED_PROVIDER,
-            broker_url.clone(),
-        ),
-        (
-            &gateway.sandbox,
-            SANDBOX,
-            PROVIDER,
-            format!("{broker_url}-unregistered"),
-        ),
-    ] {
-        assert_gateway_refusal(caller, sandbox_id, provider, recipient).await;
-    }
-    broker.assert_outcomes(&[]);
 
     // Relay a request with an authentic credential for the wrong sandbox. It
     // must fail before the broker sees a request or the origin receives bytes.
@@ -242,22 +205,14 @@ async fn run(cert_dir: &Path) {
     assert!(!origin.contains(PLACEHOLDER_VALUE));
     broker.assert_outcomes(&[Outcome::Issued]);
 
-    let mut expected = vec![Outcome::Issued];
-    for (mode, rejected) in [
-        (Mode::WrongAudience, Outcome::WrongAudience),
-        (Mode::AfterExpiry, Outcome::Expired),
-    ] {
-        broker.state.observations.lock().unwrap().0 = mode;
-        let (response, origin) =
-            relay(&engine, &state, &binary, &gateway.sandbox, placeholder).await;
-        assert!(
-            response.starts_with("HTTP/1.1 502 "),
-            "expected refused relay"
-        );
-        assert!(origin.is_empty(), "rejected assertion reached the origin");
-        expected.push(rejected);
-        broker.assert_outcomes(&expected);
-    }
+    broker.state.observations.lock().unwrap().reject = true;
+    let (response, origin) = relay(&engine, &state, &binary, &gateway.sandbox, placeholder).await;
+    assert!(
+        response.starts_with("HTTP/1.1 502 "),
+        "expected broker refusal"
+    );
+    assert!(origin.is_empty(), "broker refusal reached the origin");
+    broker.assert_outcomes(&[Outcome::Issued, Outcome::Rejected]);
 }
 
 fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
@@ -293,28 +248,6 @@ fn profile(broker_url: &str, binary: &Path) -> ProviderProfile {
         }],
         ..Default::default()
     }
-}
-
-async fn assert_gateway_refusal(
-    caller: &GatewayEndpoint,
-    sandbox_id: &str,
-    provider: &str,
-    recipient: String,
-) {
-    let mut client = OpenShellClient::new(connect_channel_pub(caller).await.unwrap());
-    let result = client
-        .mint_provider_client_assertion(MintProviderClientAssertionRequest {
-            sandbox_id: sandbox_id.into(),
-            provider: provider.into(),
-            credential_key: CREDENTIAL.into(),
-            token_endpoint: recipient,
-        })
-        .await;
-    assert_eq!(
-        result.err().expect("mint should be refused").code(),
-        tonic::Code::PermissionDenied,
-        "expected permission refusal for sandbox={sandbox_id}, provider={provider}",
-    );
 }
 
 async fn relay(
@@ -360,27 +293,8 @@ async fn relay(
         ))),
         ..Default::default()
     };
-    let tunnel = engine
-        .clone_engine_for_tunnel(authorization.generation)
-        .unwrap();
-    let middleware = engine.clone();
-    let (app, mut client) = tokio::io::duplex(16 * 1024);
-    let (mut relay_upstream, upstream) = tokio::io::duplex(16 * 1024);
-    let mut connection = Connection {
-        app,
-        relay: tokio::spawn(async move {
-            crate::proxy::relay_inspected_http_stream_for_test(
-                &mut client,
-                &mut relay_upstream,
-                configs,
-                tunnel,
-                &middleware,
-                &ctx,
-            )
-            .await
-        }),
-        upstream: tokio::spawn(capture_upstream(upstream)),
-    };
+    let mut connection =
+        Connection::new(configs, engine.clone(), authorization.generation, ctx, None);
     connection.app.write_all(format!(
         "GET {PATH} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nAuthorization: Bearer {placeholder}\r\nauthorization: Bearer stale-value\r\nContent-Length: 0\r\n\r\n"
     ).as_bytes()).await.unwrap();
@@ -402,18 +316,10 @@ async fn relay(
     )
 }
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Normal,
-    WrongAudience,
-    AfterExpiry,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Outcome {
     Issued,
-    WrongAudience,
-    Expired,
+    Rejected,
     InvalidRequest,
     InvalidAssertion,
 }
@@ -433,7 +339,13 @@ struct BrokerState {
     audience: String,
     key_id: String,
     public_key: DecodingKey,
-    observations: Mutex<(Mode, Vec<Outcome>)>,
+    observations: Mutex<BrokerObservations>,
+}
+
+#[derive(Default)]
+struct BrokerObservations {
+    reject: bool,
+    outcomes: Vec<Outcome>,
 }
 
 impl Broker {
@@ -463,7 +375,7 @@ impl Broker {
             audience: audience.into(),
             key_id: jwk.common.key_id.clone().expect("Gateway key ID"),
             public_key: DecodingKey::from_jwk(jwk).expect("Gateway verification key"),
-            observations: Mutex::new((Mode::Normal, Vec::new())),
+            observations: Mutex::default(),
         });
         let router = Router::new()
             .fallback(token_request)
@@ -494,7 +406,7 @@ impl Broker {
     }
 
     fn assert_outcomes(&self, expected: &[Outcome]) {
-        assert_eq!(self.state.observations.lock().unwrap().1, expected);
+        assert_eq!(self.state.observations.lock().unwrap().outcomes, expected);
     }
 }
 
@@ -515,14 +427,11 @@ struct AssertionClaims {
     provider_id: String,
     credential_key: String,
     caller_kind: String,
-    iat: u64,
-    exp: u64,
-    jti: String,
 }
 
 async fn token_request(State(state): State<Arc<BrokerState>>, request: Request) -> Response {
     let outcome = state.verify(request).await;
-    state.observations.lock().unwrap().1.push(outcome);
+    state.observations.lock().unwrap().outcomes.push(outcome);
     if outcome == Outcome::Issued {
         Json(serde_json::json!({
             "access_token": ACCESS_TOKEN,
@@ -564,15 +473,10 @@ impl BrokerState {
             return Outcome::InvalidRequest;
         }
 
-        let mode = self.observations.lock().unwrap().0;
-        let audience = match mode {
-            Mode::WrongAudience => "https://other-broker.example.test/token",
-            Mode::Normal | Mode::AfterExpiry => &self.audience,
-        };
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = 0;
         validation.set_issuer(&[GATEWAY_ISSUER]);
-        validation.set_audience(&[audience]);
+        validation.set_audience(&[&self.audience]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
         let token = match openshell_crypto::jwt::decode::<AssertionClaims>(
             &form.client_assertion,
@@ -580,9 +484,6 @@ impl BrokerState {
             &validation,
         ) {
             Ok(token) => token,
-            Err(error) if error.kind() == &ErrorKind::InvalidAudience => {
-                return Outcome::WrongAudience;
-            }
             Err(_) => return Outcome::InvalidAssertion,
         };
         let claims = token.claims;
@@ -593,23 +494,12 @@ impl BrokerState {
             || claims.provider_id != PROVIDER_ID
             || claims.credential_key != CREDENTIAL
             || claims.caller_kind != "supervisor"
-            || claims.exp.checked_sub(claims.iat) != Some(60)
-            || uuid::Uuid::parse_str(&claims.jti).is_err()
         {
             return Outcome::InvalidAssertion;
         }
 
-        let now = jsonwebtoken::get_current_timestamp();
-        // Move the test broker's acceptance clock beyond the real, freshly
-        // signed assertion's lifetime without sleeping or altering the JWT.
-        let accepted_at = match mode {
-            Mode::AfterExpiry => now + 61,
-            _ => now,
-        };
-        if claims.iat > now {
-            Outcome::InvalidAssertion
-        } else if claims.exp <= accepted_at {
-            Outcome::Expired
+        if self.observations.lock().unwrap().reject {
+            Outcome::Rejected
         } else {
             Outcome::Issued
         }

@@ -526,7 +526,7 @@ allow_unauthenticated_users = true
 
 ## Provider client assertions
 
-To use a provider profile with `grant_type: openshell_client_credentials`, configure gateway JWT signing, enable TLS on the supervisor-to-gateway connection, and register the provider instance and credential in the gateway configuration. Set the same canonical HTTPS URL, including the path, in the profile and registration. Omit user information, query parameters and fragments. Leave `jwt_svid_audience` and `client_assertion_type` unset.
+To use a provider profile with `grant_type: client_credentials` and `assertion_source: openshell_gateway`, configure gateway JWT signing, enable TLS on the supervisor-to-gateway connection, and register the provider instance and credential in the gateway configuration. Set the same canonical HTTPS URL, including the path, in the profile and registration. Omit user information, query parameters and fragments. Leave `jwt_svid_audience`, `client_assertion_type`, `requested_token_type`, and `subject_token` unset.
 
 ```toml
 [[openshell.gateway.provider_assertions]]
@@ -535,11 +535,13 @@ credential_key = "access_token"
 token_endpoint = "https://issuer.example/oauth/token"
 ```
 
-The gateway authorizes the authenticated sandbox against its current provider attachment and profile. The supervisor submits a 60-second JWT in the OAuth2 `client_assertion` form field. The token service must verify the signature using the configured gateway's JWKS, require EdDSA and type `openshell-provider-assertion+jwt`, and verify the expected issuer (`iss`), exact token endpoint audience (`aud`), and expiration. Require `caller_kind=supervisor` and a subject of `openshell-sandbox:<sandbox_id>` that matches the `sandbox_id` claim. Reject replayed assertion IDs (`jti`) through expiry.
+The gateway authorizes the authenticated sandbox against its current provider attachment and profile. The provider ID in the supervisor's installed credential snapshot must match the current attached provider, including after a same-name replacement. The supervisor submits a 60-second JWT in the OAuth2 `client_assertion` form field. The token service must verify the signature using the configured gateway's JWKS, require EdDSA and type `openshell-provider-assertion+jwt`, and verify the expected issuer (`iss`), exact token endpoint audience (`aud`), and expiration. Require `caller_kind=supervisor` and a subject of `openshell-sandbox:<sandbox_id>` that matches the `sandbox_id` claim. Reject replayed assertion IDs (`jti`) through expiry.
 
 Before issuing an access token, the token service must find an authorization rule that matches the verified issuer, supervisor sandbox identity, immutable `provider_id`, and `credential_key`. The same rule must allow the resource audience and every scope requested in the OAuth2 form. Apply that rule to any defaults for omitted values as well.
 
-Keep this mode out of provider profiles during mixed-version upgrades. Older gateways can interpret the new enum as SPIFFE client credentials, and older supervisors reject it if they receive it. After upgrading all gateway replicas, supervisors, and profile tooling that handle these profiles, register the provider on every gateway replica before importing or serving profiles with this mode. Remove this mode from active profiles and remove the registrations from gateway configuration before rolling back. Older gateways reject the new configuration field.
+Each gateway replica limits provider assertion requests to 60 per sandbox per minute before resolving the provider catalog. This budget is separate from extension credential minting. Cached access tokens do not consume it.
+
+Upgrade every gateway replica, supervisor, and profile reader or writer before enabling this source. The CLI checks gateway support before importing or updating a profile. A supporting gateway refuses profile reads and writes from clients that do not advertise support, and refuses an update that silently changes an existing gateway assertion credential to SPIFFE. Remove that credential before deliberately changing its source. Older supervisors reject the wire discriminator; a supporting supervisor refuses a gateway assertion when the installed provider identity is missing or the gateway does not acknowledge the same binding. Old unmodified components can still strip identity selection when they process a profile outside these checks, so do not route opted-in profiles through them. Before rollback, remove opted-in credentials and registrations while all components still support the feature. Cached access tokens can remain usable until their cache lifetime expires; removing a registration prevents new assertions but does not revoke tokens already issued by the token service.
 
 ## Service Routing
 
