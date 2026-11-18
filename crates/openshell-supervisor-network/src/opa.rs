@@ -6892,6 +6892,239 @@ network_policies:
         );
     }
 
+    // Exercise the HTTP parser, query matcher, policy decision, and first
+    // upstream write together. A read-only repository must refuse both push
+    // discovery and a direct receive-pack POST before forwarding any HTTP.
+    const NATIVE_GIT_POLICY: &str = r#"
+network_policies:
+  git:
+    name: git
+    endpoints:
+      - host: git.example.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /a.git/info/refs, query: { service: git-receive-pack } }
+          - allow: { method: POST, path: /a.git/git-receive-pack }
+          - allow: { method: GET, path: /b.git/info/refs, query: { service: git-upload-pack } }
+          - allow: { method: POST, path: /b.git/git-upload-pack }
+    binaries:
+      - { path: /usr/bin/git }
+"#;
+
+    fn native_git_relay_context(
+        engine: &OpaEngine,
+    ) -> (
+        crate::l7::L7EndpointConfig,
+        TunnelPolicyEngine,
+        crate::l7::relay::L7EvalContext,
+    ) {
+        let input = NetworkInput {
+            host: "git.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/git"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint.unwrap()).unwrap();
+        let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+        let context = crate::l7::relay::L7EvalContext {
+            host: input.host,
+            port: input.port,
+            request_default_port: Some(443),
+            policy_name: "git".into(),
+            binary_path: "/usr/bin/git".into(),
+            ..Default::default()
+        };
+        (config, tunnel, context)
+    }
+
+    async fn native_git_relay_case(engine: &OpaEngine, method: &str, target: &str, allowed: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (config, tunnel, context) = native_git_relay_context(engine);
+        let body = if method == "POST" { "0000" } else { "" };
+        let header = format!(
+            "{method} {target} HTTP/1.1\r\nHost: git.example.test\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let wire = format!("{header}{body}").into_bytes();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut origin) = tokio::io::duplex(8192);
+        let relay = async move {
+            crate::l7::relay::relay_with_inspection(
+                &config,
+                tunnel,
+                &mut relay_client,
+                &mut relay_upstream,
+                &context,
+            )
+            .await
+            .unwrap();
+        };
+        let expected = wire.clone();
+        let expected_len = expected.len();
+        let server = async move {
+            let mut received = Vec::new();
+            if allowed {
+                received.resize(expected_len, 0);
+                origin.read_exact(&mut received).await.unwrap();
+                origin
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            } else {
+                let mut first = [0; 1];
+                let count = origin.read(&mut first).await.unwrap();
+                assert_eq!(count, 0, "denied request reached origin");
+            }
+            origin.read_to_end(&mut received).await.unwrap();
+            received
+        };
+        let client = async move {
+            app.write_all(&wire).await.unwrap();
+            app.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            app.read_to_end(&mut response).await.unwrap();
+            response
+        };
+        let ((), received, response) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(relay, server, client) },
+        ))
+        .await
+        .expect("Git relay case must finish");
+        if allowed {
+            assert_eq!(received, expected, "forwarded {method} {target}");
+            assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+        } else {
+            assert!(
+                received.is_empty(),
+                "denied {method} {target} reached origin"
+            );
+            assert!(response.starts_with(b"HTTP/1.1 403 Forbidden"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_git_https_read_and_write_policy_reaches_only_allowed_origin_routes() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, NATIVE_GIT_POLICY).unwrap();
+        for (method, target, allowed) in [
+            ("GET", "/b.git/info/refs?service=git-upload-pack", true),
+            ("POST", "/b.git/git-upload-pack", true),
+            ("GET", "/b.git/info/refs?service=git-receive-pack", false),
+            ("POST", "/b.git/git-receive-pack", false),
+            ("GET", "/b.git/info/refs", false),
+            ("GET", "/b.git/info/refs?service=other", false),
+            (
+                "GET",
+                "/b.git/info/refs?service=git-upload-pack&service=git-receive-pack",
+                false,
+            ),
+            // The policy constrains the configured key and every supplied
+            // value. It does not reject extra keys or identical repetitions.
+            (
+                "GET",
+                "/b.git/info/refs?service=git-upload-pack&service=git-upload-pack&extra=1",
+                true,
+            ),
+            ("GET", "/a.git/info/refs?service=git-receive-pack", true),
+            ("POST", "/a.git/git-receive-pack", true),
+        ] {
+            Box::pin(native_git_relay_case(&engine, method, target, allowed)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_git_https_receive_pack_streams_before_the_sender_releases_its_tail() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let engine = OpaEngine::from_strings(TEST_POLICY, NATIVE_GIT_POLICY).unwrap();
+        for chunked in [false, true] {
+            let (config, tunnel, context) = native_git_relay_context(&engine);
+            let payload = vec![b'x'; 16 * 1024];
+            let (framing, prefix, tail) = if chunked {
+                let mut tail = format!("{:x}\r\n", payload.len()).into_bytes();
+                tail.extend_from_slice(&payload);
+                tail.extend_from_slice(b"\r\n0\r\n\r\n");
+                (
+                    "Transfer-Encoding: chunked".to_string(),
+                    b"4\r\nPACK\r\n".to_vec(),
+                    tail,
+                )
+            } else {
+                (
+                    format!("Content-Length: {}", 4 + payload.len()),
+                    b"PACK".to_vec(),
+                    payload,
+                )
+            };
+            let header = format!(
+                "POST /a.git/git-receive-pack HTTP/1.1\r\nHost: git.example.test\r\n{framing}\r\n\r\n"
+            );
+            let expected_header = header.clone().into_bytes();
+            let expected_prefix = prefix.clone();
+            let expected_tail = tail.clone();
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut origin) = tokio::io::duplex(8192);
+            let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+            let relay = async move {
+                crate::l7::relay::relay_with_inspection(
+                    &config,
+                    tunnel,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &context,
+                )
+                .await
+                .unwrap();
+            };
+            let server = async move {
+                let mut received = vec![0; expected_header.len() + expected_prefix.len()];
+                origin.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received[..expected_header.len()], expected_header);
+                assert_eq!(&received[expected_header.len()..], expected_prefix);
+                seen_tx.send(()).unwrap();
+                let mut remainder = vec![0; expected_tail.len()];
+                origin.read_exact(&mut remainder).await.unwrap();
+                assert_eq!(remainder, expected_tail);
+                origin
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut excess = Vec::new();
+                origin.read_to_end(&mut excess).await.unwrap();
+                assert!(excess.is_empty());
+            };
+            let client = async move {
+                app.write_all(header.as_bytes()).await.unwrap();
+                app.write_all(&prefix).await.unwrap();
+                app.flush().await.unwrap();
+                // A buffering relay deadlocks here: the sender withholds the
+                // tail until the origin confirms the first body bytes arrived.
+                seen_rx.await.unwrap();
+                app.write_all(&tail).await.unwrap();
+                app.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                app.read_to_end(&mut response).await.unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 204 No Content"));
+            };
+            Box::pin(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                async {
+                    tokio::join!(relay, server, client);
+                },
+            ))
+            .await
+            .expect("receive-pack must stream before the tail is released");
+        }
+    }
+
     #[test]
     fn l7_jsonrpc_request_params_do_not_affect_method_policy() {
         let data = r#"
