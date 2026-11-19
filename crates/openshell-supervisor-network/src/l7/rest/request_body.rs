@@ -830,8 +830,8 @@ where
 {
     let injected = body.take_injected_headers();
     let forwarded_head = body.forwarded_head().clone();
-    // Chunked input may end with trailers, which only chunked output carries.
-    let input_chunked = body.input_is_chunked();
+    let chunked_framing = body.requires_chunked_framing();
+    let _validated_permit = body.take_validated_permit();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
     let run = body.run_to(client, sender, upstream_failed, correlation);
     let upstream_for_write = &mut *upstream;
@@ -853,7 +853,7 @@ where
                     output_body_bytes,
                     ..
                 } if fixed_length.is_none() => {
-                    let output_body_bytes = output_body_bytes.filter(|_| !input_chunked);
+                    let output_body_bytes = output_body_bytes.filter(|_| !chunked_framing);
                     let head = commit_live_head(head, &header_mutations, output_body_bytes)
                         .and_then(|head| injected.apply(&head))
                         .map_err(LiveWriteError::Failed)?;

@@ -1929,6 +1929,7 @@ mod tests {
             max_payload_bytes: 1,
             timeout: Duration::from_millis(500),
             http_hook_version: None,
+            withheld_http_request: false,
         };
 
         let modes = permitted_body_modes(&input(200), &described, None);

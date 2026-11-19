@@ -6191,7 +6191,21 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 "#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        rest_token_grant_relay_context_with_engine(
+            resolver_response,
+            OpaEngine::from_strings(TEST_POLICY, data).unwrap(),
+        )
+    }
+
+    fn rest_token_grant_relay_context_with_engine(
+        resolver_response: std::result::Result<&str, TokenGrantFailure>,
+        engine: OpaEngine,
+    ) -> (
+        L7EndpointConfig,
+        TunnelPolicyEngine,
+        L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
         let input = NetworkInput {
             host: "api.example.test".into(),
             port: 8080,
@@ -14081,12 +14095,25 @@ network_policies:
     struct HookEchoRequestStage {
         drop_body: bool,
         reject: bool,
+        withhold_request: bool,
+        output: Option<(u64, bool)>,
         preflights: Arc<std::sync::Mutex<Vec<openshell_core::proto::HttpRequestHookPreflight>>>,
     }
 
     #[tonic::async_trait]
     impl openshell_core::middleware::InProcessMiddleware for HookEchoRequestStage {
         async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            let mut extension = openshell_core::extension_protocol::http_hooks_middleware_metadata(
+                "openshell/test-session-echo",
+                "test",
+            );
+            if self.withhold_request {
+                let capability =
+                    openshell_core::extension_protocol::SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST
+                        .to_string();
+                extension.supported_capabilities.push(capability.clone());
+                extension.required_capabilities.push(capability);
+            }
             openshell_core::proto::MiddlewareManifest {
                 name: "test/session-echo".into(),
                 service_version: "test".into(),
@@ -14098,12 +14125,7 @@ network_policies:
                     request_timeout: None,
                 }],
                 expected_audience: String::new(),
-                extension: Some(
-                    openshell_core::extension_protocol::http_hooks_middleware_metadata(
-                        "openshell/test-session-echo",
-                        "test",
-                    ),
-                ),
+                extension: Some(extension),
             }
         }
 
@@ -14135,7 +14157,7 @@ network_policies:
                 http_inspect, http_preflight_result, http_request_hook_event,
                 http_request_hook_result,
             };
-            let (drop_body, reject) = (self.drop_body, self.reject);
+            let (drop_body, reject, output) = (self.drop_body, self.reject, self.output);
             let preflights = Arc::clone(&self.preflights);
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
@@ -14147,7 +14169,9 @@ network_policies:
                             declared = if drop_body {
                                 Some(0)
                             } else {
-                                preflight.declared_body_bytes
+                                output
+                                    .map(|(length, _)| length)
+                                    .or(preflight.declared_body_bytes)
                             };
                             http_request_hook_result::Result::PreflightResult(HttpPreflightResult {
                                 decision: Some(http_preflight_result::Decision::Inspect(
@@ -14181,7 +14205,20 @@ network_policies:
                             })
                         }
                         Some(http_request_hook_event::Event::InputEnd(_)) => {
-                            http_request_hook_result::Result::Finish(HttpFinish::default())
+                            let trailer_mutations = if output.is_some_and(|(_, trailer)| trailer) {
+                                vec![openshell_core::proto::HeaderMutation {
+                                    operation: Some(openshell_core::proto::header_mutation::Operation::Write(openshell_core::proto::WriteHeader {
+                                        name: "x-proof".into(), value: "present".into(),
+                                        on_existing: openshell_core::proto::ExistingHeaderAction::Overwrite as i32,
+                                    })),
+                                }]
+                            } else {
+                                Vec::new()
+                            };
+                            http_request_hook_result::Result::Finish(HttpFinish {
+                                trailer_mutations,
+                                ..Default::default()
+                            })
                         }
                         _ => break,
                     };
@@ -14199,6 +14236,217 @@ network_policies:
             Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
                 receiver,
             )))
+        }
+    }
+
+    #[tokio::test]
+    async fn token_grant_waits_for_large_duplex_request_validation() {
+        const BODY_LEN: usize = 6 * 1024 * 1024;
+        const PROVIDER_KEY: &str = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let data = r#"
+network_middlewares:
+  echo:
+    middleware: test/session-echo
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        token_grant_owner: test-owner
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/v1/**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let cap = crate::l7::middleware::MAX_VALIDATED_REQUEST_BYTES;
+        for (withhold_request, reject, body_len, sent_len, denial, chunked, trailer) in [
+            (
+                true,
+                true,
+                BODY_LEN,
+                BODY_LEN,
+                Some("late_match"),
+                false,
+                false,
+            ),
+            (true, false, BODY_LEN, BODY_LEN, None, false, false),
+            // The stage exceeds the cap, then waits for more input. The relay
+            // must answer before the sandbox finishes its declared upload.
+            (
+                true,
+                false,
+                cap + 4096,
+                cap + 1,
+                Some("body_over_limit"),
+                false,
+                false,
+            ),
+            (false, false, cap + 1, cap + 1, None, false, false),
+            // Validated output framing follows the final representation.
+            (true, false, 4096, 4096, None, true, false),
+            (true, false, 4096, 4096, None, true, true),
+        ] {
+            let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+            let preflights = Arc::default();
+            engine.set_middleware_runner_for_tests(
+                openshell_supervisor_middleware::ChainRunner::new(Arc::new(HookEchoRequestStage {
+                    drop_body: false,
+                    reject,
+                    withhold_request,
+                    output: (chunked || trailer).then_some((body_len as u64, trailer)),
+                    preflights: Arc::clone(&preflights),
+                })),
+            );
+            let (config, tunnel_engine, ctx, fixture) =
+                rest_token_grant_relay_context_with_engine(Ok("grant-token"), engine);
+            let (app, mut relay_client) = tokio::io::duplex(64 * 1024);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(64 * 1024);
+            let relay = tokio::spawn(async move {
+                relay_rest(
+                    &config,
+                    &tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            });
+            let (mut app_read, mut app_write) = tokio::io::split(app);
+            let (release, released) = tokio::sync::oneshot::channel();
+            let upload = tokio::spawn(async move {
+                let framing = if chunked {
+                    if trailer {
+                        "Transfer-Encoding: chunked\r\nTrailer: x-proof".to_string()
+                    } else {
+                        "Transfer-Encoding: chunked".to_string()
+                    }
+                } else {
+                    format!("Content-Length: {body_len}")
+                };
+                let head = format!(
+                    "POST /v1/items HTTP/1.1\r\nHost: api.example.test\r\n{framing}\r\n\r\n"
+                );
+                app_write.write_all(head.as_bytes()).await?;
+                let chunk = [b'x'; 64 * 1024];
+                let mut remaining = sent_len;
+                while remaining > 0 {
+                    let count = remaining.min(chunk.len());
+                    if chunked {
+                        app_write
+                            .write_all(format!("{count:x}\r\n").as_bytes())
+                            .await?;
+                    }
+                    app_write.write_all(&chunk[..count]).await?;
+                    if chunked {
+                        app_write.write_all(b"\r\n").await?;
+                    }
+                    remaining -= count;
+                }
+                if chunked {
+                    let end = if trailer {
+                        b"0\r\nx-proof: original\r\n\r\n".as_slice()
+                    } else {
+                        b"0\r\n\r\n".as_slice()
+                    };
+                    app_write.write_all(end).await?;
+                }
+                if sent_len < body_len {
+                    let _ = released.await;
+                }
+                Ok::<_, std::io::Error>(())
+            });
+            let server = tokio::spawn(async move {
+                let mut forwarded = Vec::new();
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    let n = upstream.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    forwarded.extend_from_slice(&buffer[..n]);
+                    if denial.is_none()
+                        && forwarded
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .is_some_and(|end| {
+                                if trailer {
+                                    forwarded[end + 4..].ends_with(b"0\r\nx-proof: present\r\n\r\n")
+                                } else {
+                                    forwarded.len() >= end + 4 + body_len
+                                }
+                            })
+                    {
+                        upstream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        break;
+                    }
+                }
+                forwarded
+            });
+            let mut response = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                if sent_len < body_len {
+                    let mut first = [0u8; 1024];
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        app_read.read(&mut first),
+                    )
+                    .await
+                    .expect("over-limit response waited for more upload input")
+                    .unwrap();
+                    response.extend_from_slice(&first[..n]);
+                }
+                let _ = release.send(());
+                app_read.read_to_end(&mut response).await.unwrap();
+                let uploaded = upload.await.unwrap();
+                if denial.is_none()
+                    || body_len <= crate::l7::middleware::MAX_VALIDATED_REQUEST_BYTES
+                {
+                    uploaded.unwrap();
+                }
+                relay.await.unwrap().unwrap();
+            })
+            .await
+            .expect("protected request relay stalled");
+            let forwarded = server.await.unwrap();
+            let preflight = &preflights.lock().unwrap()[0];
+            assert_eq!(
+                preflight
+                    .limits
+                    .as_ref()
+                    .and_then(|l| l.max_output_body_bytes),
+                withhold_request
+                    .then_some(crate::l7::middleware::MAX_VALIDATED_REQUEST_BYTES as u64),
+            );
+            if let Some(reason) = denial {
+                fixture.assert_no_requests();
+                assert!(forwarded.is_empty(), "{reason} reached upstream");
+                assert!(String::from_utf8_lossy(&response).contains(reason));
+            } else {
+                fixture.assert_one_request(PROVIDER_KEY);
+                let end = forwarded.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                assert!(
+                    String::from_utf8_lossy(&forwarded[..end])
+                        .contains("Authorization: Bearer grant-token")
+                );
+                let head = String::from_utf8_lossy(&forwarded[..end]).to_ascii_lowercase();
+                if trailer {
+                    assert!(head.contains("transfer-encoding: chunked"));
+                    assert!(forwarded[end + 4..].ends_with(b"0\r\nx-proof: present\r\n\r\n"));
+                } else {
+                    assert!(head.contains(&format!("content-length: {body_len}")));
+                    assert_eq!(forwarded.len() - end - 4, body_len);
+                    assert!(forwarded[end + 4..].iter().all(|byte| *byte == b'x'));
+                }
+                assert!(response.starts_with(b"HTTP/1.1 204"));
+            }
         }
     }
 
@@ -14246,6 +14494,8 @@ network_policies:
                 openshell_supervisor_middleware::ChainRunner::new(Arc::new(HookEchoRequestStage {
                     drop_body,
                     reject,
+                    withhold_request: false,
+                    output: None,
                     preflights: Arc::clone(&preflights),
                 })),
             );
@@ -14485,6 +14735,8 @@ network_policies:
                 openshell_supervisor_middleware::ChainRunner::new(Arc::new(HookEchoRequestStage {
                     drop_body: false,
                     reject: false,
+                    withhold_request: false,
+                    output: None,
                     preflights: Arc::clone(&preflights),
                 })),
             );
@@ -14701,6 +14953,8 @@ network_policies:
             HookEchoRequestStage {
                 drop_body: false,
                 reject: false,
+                withhold_request: false,
+                output: None,
                 preflights: Arc::default(),
             }
             .open_http_request_hook(events)

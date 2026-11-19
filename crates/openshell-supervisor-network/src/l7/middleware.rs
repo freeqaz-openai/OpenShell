@@ -18,12 +18,13 @@ use openshell_supervisor_middleware::{
     HttpPipelineFinish, HttpRequestPipeline, HttpRequestPreflightInput, HttpStageDiagnostics,
     MiddlewareFailureDetail,
 };
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc, oneshot};
 use tracing::Instrument as _;
 
 use super::correlation::{RequestStage, emit_request_events};
@@ -32,6 +33,12 @@ use super::correlation::{RequestStage, emit_request_events};
 /// request middleware session is held. DUPLEX has no total deadline, so this
 /// bounds a paused upload; it matches the WebSocket message-assembly limit.
 pub const REQUEST_CLIENT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum final output of one protected request stream.
+pub const MAX_VALIDATED_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+/// Four protected requests can retain up to 16 MiB each. A slot remains held
+/// until its upstream writer finishes or is cancelled, including queued chunks.
+static VALIDATED_REQUEST_SLOTS: Semaphore = Semaphore::const_new(4);
 
 /// Longest the relay keeps discarding what the sandbox still sends after an
 /// early response.
@@ -99,6 +106,9 @@ pub enum RequestBodyDelivery {
     /// A later step needs the complete body before upstream contact, so the
     /// output is withheld and inlined into the request, up to `max_bytes`.
     Withhold { max_bytes: usize },
+    /// Run the complete middleware chain before credential acquisition, then
+    /// replay its validated output without retaining an inline request body.
+    ValidatedStream,
 }
 
 impl RequestBodyDelivery {
@@ -112,7 +122,7 @@ impl RequestBodyDelivery {
     #[must_use]
     pub const fn or_withhold(self) -> Self {
         match self {
-            Self::Incremental => Self::WITHHOLD,
+            Self::Incremental | Self::ValidatedStream => Self::WITHHOLD,
             withhold @ Self::Withhold { .. } => withhold,
         }
     }
@@ -123,6 +133,7 @@ impl RequestBodyDelivery {
         match self {
             Self::Incremental => None,
             Self::Withhold { max_bytes } => Some(max_bytes),
+            Self::ValidatedStream => Some(MAX_VALIDATED_REQUEST_BYTES),
         }
     }
 }
@@ -1014,6 +1025,14 @@ async fn apply_middleware_chain_for_scheme_with_request_id_and_delivery_correlat
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
+    let delivery = if delivery == RequestBodyDelivery::Incremental
+        && chain.iter().any(
+            openshell_supervisor_middleware::DescribedChainEntry::requires_withheld_http_request,
+        ) {
+        RequestBodyDelivery::ValidatedStream
+    } else {
+        delivery
+    };
     let has_stages = !chain.is_empty();
     let apply = async {
         let span = if has_stages && correlation.is_some() {
@@ -1239,6 +1258,15 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
     span: tracing::Span,
 ) -> Result<MiddlewareApplyResult> {
     let head = &req.raw_header[..request_header_end(&req.raw_header)];
+    let validated_stream = delivery == RequestBodyDelivery::ValidatedStream
+        && !matches!(req.body_length, crate::l7::provider::BodyLength::None)
+        && request_line_is_http11(head)
+        && !crate::l7::rest::request_has_upgrade_header(head);
+    let delivery = if delivery == RequestBodyDelivery::ValidatedStream && !validated_stream {
+        RequestBodyDelivery::WITHHOLD
+    } else {
+        delivery
+    };
     // Output that cannot stream to the upstream is withheld up to the route's
     // limit, and DUPLEX stages learn that limit at preflight. A chain whose
     // final stage buffers is withheld too, but within its smaller WHOLE_BODY cap.
@@ -1287,6 +1315,81 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
 
     let (prepared_headers, mut reader) =
         crate::l7::rest::prepare_request_body_stream(&req, client).await?;
+    if validated_stream {
+        let progress = session
+            .may_stream()
+            .then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
+        let Ok(permit) = VALIDATED_REQUEST_SLOTS.try_acquire() else {
+            session.end(MiddlewareSessionEndReason::Cancellation).await;
+            emit_middleware_session_capacity_exhausted(ctx, "http_request", true);
+            return Ok(MiddlewareApplyResult::AdmissionExhausted);
+        };
+        let (output, outputs) = mpsc::channel(4);
+        let (cancel, cancelled) = oneshot::channel();
+        let run = run_request_body(
+            session,
+            &mut reader,
+            client,
+            generation_guard,
+            progress,
+            output,
+            RequestBodyRun::UntilCancelled(cancelled),
+        )
+        .instrument(span);
+        let collect = async {
+            let result = collect_validated_output(outputs).await;
+            if result.is_none() {
+                let _ = cancel.send(());
+            }
+            result
+        };
+        let (result, collected) = tokio::join!(run, collect);
+        let (mut finish, outputs) = match (result, collected) {
+            (_, None) => {
+                events.emit(
+                    false,
+                    "middleware_failed: request_output_over_capacity",
+                    None,
+                    HttpStageDiagnostics::default(),
+                    correlation,
+                );
+                return Ok(MiddlewareApplyResult::Denied {
+                    denial: None,
+                    failure: Some(MiddlewareFailureDetail {
+                        config_name: None,
+                        code: HttpFailureCode::BodyOverLimit,
+                    }),
+                });
+            }
+            (Err(error), _) => return events.body_failed(error, correlation),
+            (Ok(finish), Some(outputs)) => (finish, outputs),
+        };
+        generation_guard.ensure_current()?;
+        let request = crate::l7::rest::rebuild_request_for_live_body(
+            &req,
+            &prepared_headers,
+            &preflight.header_mutations,
+        )?;
+        let forwarded_head = ForwardedRequestHead::new(&request);
+        events.emit(
+            true,
+            "",
+            None,
+            std::mem::take(&mut finish.diagnostics),
+            correlation,
+        );
+        return Ok(MiddlewareApplyResult::Streamed {
+            request,
+            body: Box::new(RequestBodyStream {
+                source: Some(RequestBodySource::Validated { outputs, finish }),
+                validated_permit: Some(permit),
+                events,
+                generation_guard: generation_guard.clone(),
+                injected_headers: crate::l7::token_grant_injection::InjectedHeaders::default(),
+                forwarded_head,
+            }),
+        });
+    }
     if withheld_limit.is_none() && !session.buffers_final_output() {
         let request = crate::l7::rest::rebuild_request_for_live_body(
             &req,
@@ -1297,8 +1400,11 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         return Ok(MiddlewareApplyResult::Streamed {
             request,
             body: Box::new(RequestBodyStream {
-                reader,
-                session: Some(session),
+                source: Some(RequestBodySource::Live {
+                    reader,
+                    session: Box::new(session),
+                }),
+                validated_permit: None,
                 events,
                 generation_guard: generation_guard.clone(),
                 injected_headers: crate::l7::token_grant_injection::InjectedHeaders::default(),
@@ -1339,7 +1445,7 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         generation_guard,
         progress,
         output,
-        transformed_body_policy,
+        RequestBodyRun::Policy(transformed_body_policy),
     )
     .instrument(span);
     let (result, collected) = tokio::join!(run, collect);
@@ -1381,6 +1487,38 @@ async fn apply_pipeline_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Sen
         correlation,
     );
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
+}
+
+async fn collect_validated_output(
+    mut outputs: mpsc::Receiver<HttpBodyOutput>,
+) -> Option<VecDeque<HttpBodyOutput>> {
+    let mut retained = VecDeque::new();
+    let mut bytes = 0usize;
+    while let Some(event) = outputs.recv().await {
+        if let HttpBodyOutput::Chunk(data) = event {
+            bytes = bytes.saturating_add(data.len());
+            if bytes > MAX_VALIDATED_REQUEST_BYTES {
+                return None;
+            }
+            let unit = openshell_supervisor_middleware::MAX_HTTP_STREAM_UNIT_BYTES;
+            let mut remaining = data.as_slice();
+            while !remaining.is_empty() {
+                if !matches!(retained.back(), Some(HttpBodyOutput::Chunk(chunk)) if chunk.len() < unit)
+                {
+                    retained.push_back(HttpBodyOutput::Chunk(Vec::with_capacity(unit)));
+                }
+                let Some(HttpBodyOutput::Chunk(chunk)) = retained.back_mut() else {
+                    unreachable!()
+                };
+                let take = remaining.len().min(unit - chunk.len());
+                chunk.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+            }
+        } else {
+            retained.push_back(event);
+        }
+    }
+    Some(retained)
 }
 
 /// Request head and framing shown to request middleware.
@@ -1437,6 +1575,11 @@ enum BodyRunError {
     Client(miette::Report),
 }
 
+enum RequestBodyRun<'a> {
+    Policy(openshell_supervisor_middleware::TransformedBodyPolicy<'a>),
+    UntilCancelled(oneshot::Receiver<()>),
+}
+
 /// Feed a request body to `session` while it runs. Dropping the future
 /// cancels every stage.
 async fn run_request_body<C: AsyncRead + Unpin>(
@@ -1446,15 +1589,27 @@ async fn run_request_body<C: AsyncRead + Unpin>(
     generation_guard: &PolicyGenerationGuard,
     progress: Option<Duration>,
     output: mpsc::Sender<HttpBodyOutput>,
-    body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
+    mode: RequestBodyRun<'_>,
 ) -> std::result::Result<HttpPipelineFinish, BodyRunError> {
     let limit = session.input_unit_limit();
     let (input, inputs) = mpsc::channel(4);
     let run = async {
-        session
-            .run_with_body_policy(inputs, output, body_policy)
-            .await
-            .map_err(BodyRunError::Middleware)
+        let result = match mode {
+            RequestBodyRun::UntilCancelled(cancelled) => {
+                session
+                    .run_until(inputs, output, async {
+                        if cancelled.await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        MiddlewareSessionEndReason::Cancellation
+                    })
+                    .await
+            }
+            RequestBodyRun::Policy(policy) => {
+                session.run_with_body_policy(inputs, output, policy).await
+            }
+        };
+        result.map_err(BodyRunError::Middleware)
     };
     let feed = feed_request_body(reader, client, generation_guard, limit, progress, input);
     let (finish, ()) = tokio::try_join!(run, feed)?;
@@ -1650,13 +1805,24 @@ impl RequestEvents {
 
 /// A request body that request middleware streams to the upstream.
 pub struct RequestBodyStream {
-    reader: crate::l7::rest::RequestBodyReader,
-    session: Option<HttpRequestPipeline>,
+    source: Option<RequestBodySource>,
+    validated_permit: Option<SemaphorePermit<'static>>,
     events: RequestEvents,
     generation_guard: PolicyGenerationGuard,
     injected_headers: crate::l7::token_grant_injection::InjectedHeaders,
     /// The head before credentials, completed by late mutations at commit.
     forwarded_head: ForwardedRequestHead,
+}
+
+enum RequestBodySource {
+    Live {
+        reader: crate::l7::rest::RequestBodyReader,
+        session: Box<HttpRequestPipeline>,
+    },
+    Validated {
+        outputs: VecDeque<HttpBodyOutput>,
+        finish: HttpPipelineFinish,
+    },
 }
 
 impl RequestBodyStream {
@@ -1680,9 +1846,21 @@ impl RequestBodyStream {
         std::mem::take(&mut self.injected_headers)
     }
 
-    /// True when the client's body is chunked and so may end with trailers.
-    pub(crate) fn input_is_chunked(&self) -> bool {
-        matches!(self.reader, crate::l7::rest::RequestBodyReader::Chunked(_))
+    /// Live output may still acquire trailers; validated output has its final trailers.
+    pub(crate) fn requires_chunked_framing(&self) -> bool {
+        match self.source.as_ref() {
+            Some(RequestBodySource::Live { reader, .. }) => {
+                matches!(reader, crate::l7::rest::RequestBodyReader::Chunked(_))
+            }
+            Some(RequestBodySource::Validated { finish, .. }) => !finish.trailers.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Transfer the retained-output slot to the upload future, so it covers
+    /// both the replay queue and the writer until completion or cancellation.
+    pub(crate) fn take_validated_permit(&mut self) -> Option<SemaphorePermit<'static>> {
+        self.validated_permit.take()
     }
 
     /// Run the middleware over the client's body, sending output to
@@ -1698,21 +1876,39 @@ impl RequestBodyStream {
         upstream_failed: &AtomicBool,
         correlation: Option<&super::correlation::RequestCorrelation>,
     ) -> Result<HttpPipelineFinish> {
-        let session = self
-            .session
+        let source = self
+            .source
             .take()
             .ok_or_else(|| miette!("request middleware body already ran"))?;
+        let (mut reader, session) = match source {
+            RequestBodySource::Live { reader, session } => (reader, *session),
+            RequestBodySource::Validated {
+                mut outputs,
+                finish,
+                ..
+            } => {
+                while let Some(event) = outputs.pop_front() {
+                    output
+                        .send(event)
+                        .await
+                        .map_err(|_| miette!("upstream stopped accepting validated output"))?;
+                }
+                return Ok(finish);
+            }
+        };
         let progress = session
             .may_stream()
             .then_some(REQUEST_CLIENT_PROGRESS_TIMEOUT);
         let error = match run_request_body(
             session,
-            &mut self.reader,
+            &mut reader,
             client,
             &self.generation_guard,
             progress,
             output,
-            openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            RequestBodyRun::Policy(
+                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            ),
         )
         .instrument(self.events.span.clone().unwrap_or_else(tracing::Span::none))
         .await

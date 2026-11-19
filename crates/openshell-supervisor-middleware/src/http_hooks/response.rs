@@ -488,6 +488,7 @@ mod tests {
             max_payload_bytes: limit,
             timeout: std::time::Duration::from_millis(500),
             http_hook_version: Some(HttpHookVersion::Current),
+            withheld_http_request: false,
         }
     }
 

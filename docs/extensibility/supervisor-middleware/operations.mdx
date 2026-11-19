@@ -60,6 +60,8 @@ OpenShell applies middleware changes before it injects provider credentials. Mid
 
 Request output streams to the external service while the sandbox uploads. OpenShell instead buffers output when a stage selects WHOLE_BODY, the route needs SigV4 signing or body credential rewriting, or the request uses the forward proxy, HTTP/1.0, or `Upgrade`. JSON-RPC, MCP, and GraphQL endpoints also buffer output so OpenShell can check the replaced body against policy. Buffered output can be up to 10 MiB for SigV4 signing, 256 KiB for body credential rewriting, and 4 MiB otherwise. The preflight reports this limit to DUPLEX stages as `limits.max_output_body_bytes`. Larger output fails with `body_over_limit`.
 
+To require complete request validation before OpenShell acquires credentials or writes any HTTP request bytes to the external service, require both `openshell.supervisor-middleware.http-hooks` and `openshell.supervisor-middleware.withheld-http-request` in the service's extension metadata. Peers that cannot provide this guarantee reject the service during negotiation. For eligible HTTP/1.1 requests, OpenShell holds the final output until every stage finishes successfully and then replays it using the existing DUPLEX protocol. The supervisor admits at most four retained protected requests, each capped at 16 MiB, for at most 64 MiB of retained output. The preflight advertises the applicable per-request limit in `limits.max_output_body_bytes`; middleware must deny when this field is absent or too small. If all four slots are occupied, OpenShell returns `503 Service Unavailable`. Routes that already require a smaller buffering limit retain that limit. Services that do not require withholding keep ordinary incremental streaming.
+
 ### Responses
 
 Your service receives the response status, headers, and request context. It can return `continue_without_body` or choose a body mode with `inspect`.
@@ -83,7 +85,7 @@ The preflight lists `permitted_body_modes`, unavailable modes with their reasons
 | `WHOLE_BODY` | Select `whole_body` with a positive `max_body_bytes` within the advertised limit. After `begin`, receive one `whole_body` with the complete body and trailers. Return `whole_body_result` with `unchanged` or `replacement`. Empty replacement bytes delete the body. This stage withholds its output until its `whole_body_result`. Later stages can select `DUPLEX`. |
 | `DUPLEX` | After `begin`, receive `input_chunk` events and one `input_end` with trailers. Send `output_start`, any number of `output_chunk` results, and `finish` after `input_end`. Send every output byte, including unchanged bytes. Input and output chunk counts can differ. |
 
-A DUPLEX stage must send `output_start` even for empty output. Set its `output_body_bytes` when you know the exact output length. OpenShell uses `Content-Length` when the output declares a length and chunked framing otherwise. It flushes each server-sent event chunk.
+A DUPLEX stage must send `output_start` even for empty output. Set its `output_body_bytes` when you know the exact output length. OpenShell uses `Content-Length` when the output declares a length and chunked framing otherwise. Withheld requests use chunked framing when the final output contains trailers. It flushes each server-sent event chunk.
 
 Your service can deny a request with `deny` or stop a response with `block_delivery` throughout inspection. After a terminal result, close your result stream or wait for the best-effort `session_end` notification. An unset, unknown, or out-of-order result fails closed.
 
@@ -244,7 +246,7 @@ The gateway also rejects a policy in which a `fail_closed` entry can select a `t
 | Preflight | HTTP hooks | Binding timeout per stage. Initial preflights share a 30-second setup budget; each deferred preflight gets a new 30-second setup budget when its input headers arrive. Capacity waits use that budget. |
 | Concurrent HTTP requests and responses | HTTP hooks | 64 in preflight or WHOLE_BODY processing, and 256 with DUPLEX or deferred stages, per sandbox. WHOLE_BODY stages of one request or response share a slot. A DUPLEX stage releases the buffering slot until another stage needs it. |
 | Whole body | HTTP hooks | Stage payload limit, up to 4 MiB. Two minutes to receive, process, and deliver; individual exchanges also obey the binding timeout. |
-| Duplex body | HTTP hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
+| Duplex body | HTTP hooks | No total duration limit. No total size limit unless the preflight sets `limits.max_output_body_bytes` for buffered request output. Withheld request streams share a 64 MiB supervisor budget. Chunks are at most 64 KiB or the stage payload limit, whichever is smaller. |
 | Middleware stall | HTTP DUPLEX | 30 seconds to accept the next input, or between results after `input_end`. Waiting for the sandbox or external service to produce input does not count. |
 | Request upload stall | HTTP DUPLEX or deferred stages | 30 seconds without progress from the sandbox. |
 | Payload per middleware | Legacy HTTP hooks and WebSocket | Registration `max_payload_bytes`, up to 4 MiB, for each body, response piece, message, or replacement. |

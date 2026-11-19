@@ -124,6 +124,17 @@ impl HttpRequestPipeline {
             .await
     }
 
+    /// Run the request body stages, settling the exchange with the caller's
+    /// reason when external cancellation wins.
+    pub async fn run_until(
+        self,
+        input: mpsc::Receiver<HttpBodyInput>,
+        output: mpsc::Sender<HttpBodyOutput>,
+        abort: impl Future<Output = MiddlewareSessionEndReason>,
+    ) -> Result<HttpPipelineFinish, HttpMiddlewareFailure> {
+        self.pipeline.run_until(input, output, abort).await
+    }
+
     /// End every stage without sending the body.
     pub async fn end(self, reason: MiddlewareSessionEndReason) {
         self.pipeline.end(reason).await;

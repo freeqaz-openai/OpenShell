@@ -44,8 +44,8 @@ use miette::{Result, miette};
 use prost::Message;
 
 use openshell_core::extension_protocol::{
-    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_HOOKS, gateway_metadata,
-    negotiate,
+    ExtensionFamily, NegotiatedExtension, SUPERVISOR_MIDDLEWARE_HTTP_HOOKS,
+    SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST, gateway_metadata, negotiate,
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
@@ -439,6 +439,15 @@ fn requires_http_hooks(manifest: &MiddlewareManifest) -> bool {
     })
 }
 
+fn requires_withheld_http_request(manifest: &MiddlewareManifest) -> bool {
+    manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST)
+    })
+}
+
 /// HTTP hook version of one binding: `None` for a WebSocket or unknown
 /// operation. The service's capabilities select the hook version for all of
 /// its HTTP bindings.
@@ -485,6 +494,22 @@ fn validate_manifest_http_hooks_capability(
     if supported && !requires_http_hooks(manifest) {
         return Err(miette!(
             "{source} supports {SUPERVISOR_MIDDLEWARE_HTTP_HOOKS} without requiring it; list it in required_capabilities so that peers without HTTP hooks reject the service instead of calling legacy HTTP hooks"
+        ));
+    }
+    let supports_withholding = manifest.extension.as_ref().is_some_and(|extension| {
+        extension
+            .supported_capabilities
+            .iter()
+            .any(|capability| capability == SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST)
+    });
+    if supports_withholding && !requires_withheld_http_request(manifest) {
+        return Err(miette!(
+            "{source} supports {SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST} without requiring it"
+        ));
+    }
+    if requires_withheld_http_request(manifest) && !requires_http_hooks(manifest) {
+        return Err(miette!(
+            "{source} requires {SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST} without {SUPERVISOR_MIDDLEWARE_HTTP_HOOKS}"
         ));
     }
     Ok(())
@@ -548,6 +573,8 @@ pub struct DescribedChainEntry {
     timeout: Duration,
     /// HTTP hook version of the resolved binding.
     http_hook_version: Option<HttpHookVersion>,
+    /// This resolved request binding requires full output withholding.
+    withheld_http_request: bool,
 }
 
 struct DescribedChain {
@@ -587,6 +614,13 @@ impl DescribedChainEntry {
     #[must_use]
     pub fn http_hook_version(&self) -> Option<HttpHookVersion> {
         self.http_hook_version
+    }
+
+    /// Whether this request binding requires terminal success before any
+    /// credential acquisition or upstream HTTP request bytes.
+    #[must_use]
+    pub fn requires_withheld_http_request(&self) -> bool {
+        self.withheld_http_request
     }
 
     /// Policy-local middleware config name.
@@ -1944,6 +1978,7 @@ impl ChainRunner {
                     max_payload_bytes: 0,
                     timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                     http_hook_version: None,
+                    withheld_http_request: false,
                 });
                 continue;
             };
@@ -1975,6 +2010,8 @@ impl ChainRunner {
                 max_payload_bytes,
                 timeout,
                 http_hook_version,
+                withheld_http_request: operation == SupervisorMiddlewareOperation::HttpRequest
+                    && requires_withheld_http_request(manifest),
             });
         }
         ensure_chain_capacity(described_entries.len())?;

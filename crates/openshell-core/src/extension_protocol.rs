@@ -37,6 +37,12 @@ pub const COMPUTE_UPDATE_SANDBOX_CONFIGURATION: &str =
 /// `Describe` instead of calling the deprecated legacy HTTP hooks.
 pub const SUPERVISOR_MIDDLEWARE_HTTP_HOOKS: &str = "openshell.supervisor-middleware.http-hooks";
 
+/// Request HTTP hooks may require that the complete final output is held
+/// through terminal success before credentials are acquired or HTTP bytes are
+/// sent upstream. This capability requires HTTP hooks.
+pub const SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST: &str =
+    "openshell.supervisor-middleware.withheld-http-request";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
@@ -145,6 +151,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
         }
         ExtensionFamily::SupervisorMiddleware => {
             supported_capabilities.push(SUPERVISOR_MIDDLEWARE_HTTP_HOOKS.to_string());
+            supported_capabilities.push(SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST.to_string());
         }
         ExtensionFamily::Credentials | ExtensionFamily::GatewayInterceptor => {}
     }
@@ -563,6 +570,38 @@ mod tests {
                 .required_capabilities
                 .iter()
                 .any(|capability| capability == SUPERVISOR_MIDDLEWARE_HTTP_HOOKS)
+        );
+
+        let mut protected = middleware.clone();
+        protected
+            .supported_capabilities
+            .push(SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST.to_string());
+        protected
+            .required_capabilities
+            .push(SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST.to_string());
+        negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &gateway,
+            Some(protected.clone()),
+        )
+        .expect("a peer with request withholding accepts the service");
+        let mut hooks_only = gateway.clone();
+        hooks_only
+            .supported_capabilities
+            .retain(|capability| capability != SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST);
+        let error = negotiate(
+            ExtensionFamily::SupervisorMiddleware,
+            "example/guard",
+            &hooks_only,
+            Some(protected),
+        )
+        .expect_err("HTTP hooks alone cannot promise request withholding");
+        assert!(
+            error
+                .to_string()
+                .contains(SUPERVISOR_MIDDLEWARE_WITHHELD_HTTP_REQUEST),
+            "{error}"
         );
 
         // A peer that predates HTTP hooks advertises only the

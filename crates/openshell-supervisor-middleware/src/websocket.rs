@@ -1460,6 +1460,7 @@ mod tests {
                 max_payload_bytes: 1024,
                 timeout: Duration::from_secs(1),
                 http_hook_version: None,
+                withheld_http_request: false,
             },
             transport: Some(WebSocketStageTransport {
                 sender,
